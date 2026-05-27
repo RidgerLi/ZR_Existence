@@ -43,7 +43,8 @@ class ZerolanLiveRobot(BaseBot):
     def __init__(self):
         super().__init__()
         self.cur_lang = Language.ZH
-        self.tts_prompt_manager.set_lang(self.cur_lang)
+        if self.tts_prompt_manager is not None:
+            self.tts_prompt_manager.set_lang(self.cur_lang)
         self._timer_flag = True
         self.tts_thread_pool = ThreadPoolExecutor(max_workers=1)
         self.enable_exp_memory = _config.system.enable_intelligent_memory
@@ -489,7 +490,8 @@ class ZerolanLiveRobot(BaseBot):
 
     def change_lang(self, lang: Language):
         self.cur_lang = lang.name()
-        self.tts_prompt_manager.set_lang(self.cur_lang)
+        if self.tts_prompt_manager is not None:
+            self.tts_prompt_manager.set_lang(self.cur_lang)
 
     def check_img(self, img) -> bool:
         if is_image_uniform(img):

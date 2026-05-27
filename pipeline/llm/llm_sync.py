@@ -34,10 +34,10 @@ class LLMSyncPipeline(CommonModelPipeline):
 
     def __init__(self, config: LLMPipelineConfig):
         super().__init__(config)
-        # Kimi API supported
-        # Reference: https://platform.moonshot.cn/docs/guide/start-using-kimi-api
-        # Deepseek API supported
-        # Reference: https://api-docs.deepseek.com/zh-cn/
+        # When `openai_format` is True, we delegate all chat requests to the OpenAI SDK
+        # and forward `config.model_id` verbatim as the `model` parameter. This works
+        # for any OpenAI-compatible service (DeepSeek / Kimi / Doubao / OpenAI / ...),
+        # so adding a new provider or a new model version requires NO code change here.
         self._is_openai_format = config.openai_format
         if self._is_openai_format:
             assert config.predict_url and config.stream_predict_url, "Please provide `predict_url` or `stream_predict_url`"
@@ -48,35 +48,13 @@ class LLMSyncPipeline(CommonModelPipeline):
     def predict(self, query: LLMQuery) -> LLMPrediction | None:
         assert isinstance(query, LLMQuery)
         if self._is_openai_format:
-            if self.model_id == "moonshot-v1-8k":
-                def wrapper_kimi(messages):
-                    return self._remote_model.chat.completions.create(
-                        model=self.model_id,
-                        messages=messages,
-                        temperature=0.3
-                    )
+            def wrapper(messages):
+                return self._remote_model.chat.completions.create(
+                    model=self.model_id,
+                    messages=messages,
+                )
 
-                return _openai_predict(query, wrapper_kimi)
-            elif self.model_id == "deepseek-chat":
-                def wrapper_deepseek(messages):
-                    return self._remote_model.chat.completions.create(
-                        model=self.model_id,
-                        messages=messages,
-                        stream=False
-                    )
-
-                return _openai_predict(query, wrapper_deepseek)
-            elif self.model_id == "doubao-seed-1-6-flash-250715":
-                def wrapper_doubao(messages):
-                    return self._remote_model.chat.completions.create(
-                        model=self.model_id,
-                        messages=messages,
-                        stream=False
-                    )
-
-                return _openai_predict(query, wrapper_doubao)
-            else:
-                raise NotImplementedError(f"Unsupported model {self.model_id}")
+            return _openai_predict(query, wrapper)
         else:
             return super().predict(query)
 

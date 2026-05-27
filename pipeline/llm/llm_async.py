@@ -4,13 +4,13 @@ from typeguard import typechecked
 from zerolan.data.pipeline.llm import LLMQuery, LLMPrediction
 
 from pipeline.base.base_async import BaseAsyncPipeline, get_base_url
-from pipeline.llm.config import LLMPipelineConfig, LLMModelIdEnum
+from pipeline.llm.config import LLMPipelineConfig
 
 
 class LLMAsyncPipeline(BaseAsyncPipeline):
     def __init__(self, config: LLMPipelineConfig):
         super().__init__(base_url=get_base_url(config.predict_url))
-        self._model_id: LLMModelIdEnum = config.model_id
+        self._model_id: str = config.model_id
         self._predict_endpoint = "/llm/predict"
         self._stream_predict_endpoint = "/llm/stream-predict"
 
