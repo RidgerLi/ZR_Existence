@@ -106,10 +106,9 @@ def sentiment_analyse(sentiments: List[str], text: str) -> str:
     for sentiment in sentiments:
         if sentiment in response.content:
             return sentiment
-    for sentiment in sentiments:
-        for default in ["Default", "Normal", "默认", "正常"]:
-            if default in response.content:
-                return sentiment
+    for default in ["Default", "Normal", "默认", "正常"]:
+        if default in response.content:
+            return sentiment
     return sentiments[0]
 
 
