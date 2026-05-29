@@ -17,6 +17,15 @@ class SystemConfig(BaseModel):
                                    description="Your microphone is set to be off when the program starts. One tap on this hotkey will change its status between on and off.\n" \
                                                "You can pick your own hotkey on Key names like: {} ...".format(
                                        try_get_pynput_key_enum_str()))
+    enable_echo_suppression: bool = Field(default=True,
+                                          description="Half-duplex echo suppression. When `True`, the microphone (VAD) is gated off while "
+                                                      "the bot is playing its own TTS audio through the LOCAL speaker, so the bot does not "
+                                                      "capture and feed its own voice back into ASR. Disable this if you use headphones or a "
+                                                      "device with hardware echo cancellation and want barge-in (interrupting the bot by talking).")
+    echo_suppression_tail_ms: int = Field(default=500,
+                                          description="Extra milliseconds to keep the microphone gated off AFTER local playback finishes. "
+                                                      "Covers room reverberation and audio buffer drain so the bot's own trailing audio is not "
+                                                      "picked up as user speech. Only effective when `enable_echo_suppression` is True.")
     enable_clause_split: bool = Field(default=True,
                                       description='If `True`, splits LLM responses into smaller clauses before sending to TTS service. '
                                                   'This enables faster audio generation and reduced latency for real-time applications. \n'
@@ -28,7 +37,7 @@ class SystemConfig(BaseModel):
                                                    '(the default TTS prompt is used) because the sentiment LLM call would otherwise re-serialize the whole pipeline. \n'
                                                    'Set to `False` to keep the legacy blocking behavior (slower but compatible with sentiment-based prompt selection).')
     enable_sentiment_analysis: bool = Field(default=False, description='Automatically analyzes sentiment to select appropriate TTS prompts. '
-                                                                      'This also increases token consumption and adds slight latency due to extra processing. '
+                                                                      'This also increases token consumption and adds latency due to extra processing. '
                                                                       'Has no effect on the streaming voice path when `enable_streaming_llm` is True.')
     enable_intelligent_memory: bool = Field(default=False,
                                             description='🧪 EXPERIMENTAL: Automatically scores and filters conversation history entries based on sentiment, relevance, and safety.')

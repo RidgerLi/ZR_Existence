@@ -1,5 +1,6 @@
 import io
 import threading
+import time
 import wave
 
 import pyaudio
@@ -14,7 +15,8 @@ from event.event_emitter import emitter
 
 class SmartMicrophone(ThreadRunnable):
     def __init__(self, enable_vad: bool = False, vad_mode=3, frame_duration=30,
-                 silence_hangover_ms: int = 700, min_speech_ms: int = 300):
+                 silence_hangover_ms: int = 700, min_speech_ms: int = 500,
+                 playback_tail_ms: int = 500):
         """
         初始化智能麦克风类
         :param enable_vad: 是否启用 webrtcvad 进行语音端点检测。开启后讲话间隔超过
@@ -25,6 +27,9 @@ class SmartMicrophone(ThreadRunnable):
         :param silence_hangover_ms: 连续多少毫秒静音后才认为一句话说完，默认 700ms。
         :param min_speech_ms: 一句话至少要有多少毫秒的语音帧才会被发出去，默认 300ms。
                               用来过滤 VAD 抖动产生的噪声小段。
+        :param playback_tail_ms: 半双工回声抑制的"尾巴"时长。机器人通过扬声器播放完音频后，
+                                 还要再额外抑制麦克风这么多毫秒，用来覆盖混响和音频缓冲的残留，
+                                 避免机器人自己的尾音被 VAD 当作用户输入重新采集。
         """
         super().__init__()
         self._enable_vad = enable_vad
@@ -69,6 +74,17 @@ class SmartMicrophone(ThreadRunnable):
         # 外部环境可用的锁
         self._recording_lock = threading.Lock()
 
+        # 半双工回声抑制（playback gate）：
+        # 当机器人通过扬声器播放 TTS 音频时，麦克风会把这段音频重新采集进来，
+        # VAD 会把它当成用户语音发给 ASR，从而出现"AI 截获自己输出的音频"的自循环。
+        # 这里用一道门把播放期间（及结束后的尾巴时间）采集到的帧直接丢弃。
+        self._playback_tail_s = max(0.0, playback_tail_ms / 1000.0)
+        self._playback_lock = threading.Lock()
+        # 当前正在播放的音频片段计数，> 0 表示正在播放
+        self._playback_count = 0
+        # 播放结束后允许恢复采集的单调时间戳（monotonic seconds）
+        self._suppress_until = 0.0
+
     @property
     def is_recording(self):
         # return self._pause_event.is_set() and (not self._stop_flag) and self._stream.is_active()
@@ -102,7 +118,33 @@ class SmartMicrophone(ThreadRunnable):
             self._stream.close()
             self._audio.terminate()
 
+    def _is_playback_suppressed(self) -> bool:
+        with self._playback_lock:
+            if self._playback_count > 0:
+                return True
+            return time.monotonic() < self._suppress_until
+
+    def begin_playback(self):
+        """扬声器开始播放本地音频时调用：立即关闭麦克风采集（半双工）。"""
+        with self._playback_lock:
+            self._playback_count += 1
+
+    def end_playback(self):
+        """扬声器播放完一段本地音频时调用：在尾巴时间过后再恢复采集。"""
+        with self._playback_lock:
+            if self._playback_count > 0:
+                self._playback_count -= 1
+            if self._playback_count == 0:
+                self._suppress_until = time.monotonic() + self._playback_tail_s
+
     def _vad_record(self, data: bytes):
+        # 半双工抑制：播放期间（及尾巴时间内）采集到的都是机器人自己的声音，直接丢弃，
+        # 并清空已经累积的片段，避免把自己的输出当成用户输入发给 ASR。
+        if self._is_playback_suppressed():
+            if self._is_speaking or self._audio_frames:
+                self._reset_vad_state()
+            return
+
         if self._enable_vad:
             is_speech = self._vad.is_speech(data, self._sample_rate)
 

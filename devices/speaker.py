@@ -2,8 +2,10 @@ import threading
 from enum import Enum
 from pathlib import Path
 from queue import Queue
+from typing import Callable
 
 import pygame
+from loguru import logger
 
 from common.concurrent.abs_runnable import ThreadRunnable
 from common.concurrent.killable_thread import KillableThread
@@ -35,6 +37,16 @@ class Speaker(ThreadRunnable):
         self._semaphore = threading.Event()
         self._speaker_thread = KillableThread(target=self._run)
         self.audio_clips: Queue[Path] = Queue()
+        # 本地播放开始 / 结束的回调钩子。用于半双工回声抑制：
+        # 播放本地音频前后通知麦克风关门 / 开门，避免机器人采集到自己的声音。
+        self._on_playback_start: Callable[[], None] | None = None
+        self._on_playback_end: Callable[[], None] | None = None
+
+    def set_playback_hooks(self, on_start: Callable[[], None] | None,
+                           on_end: Callable[[], None] | None):
+        """设置本地播放前后的回调（用于半双工回声抑制）。"""
+        self._on_playback_start = on_start
+        self._on_playback_end = on_end
 
     def start(self):
         super().start()
@@ -56,7 +68,20 @@ class Speaker(ThreadRunnable):
             self._semaphore.wait()
             audio_clip = self.audio_clips.get()
             emitter.emit(DeviceSpeakerPlayEvent(audio_path=audio_clip))
-            self.playsound(audio_clip, block=True)
+            # 半双工：播放前关闭麦克风采集，播放后再恢复（钩子内部负责尾巴延时）。
+            if self._on_playback_start is not None:
+                try:
+                    self._on_playback_start()
+                except Exception as e:
+                    logger.exception(e)
+            try:
+                self.playsound(audio_clip, block=True)
+            finally:
+                if self._on_playback_end is not None:
+                    try:
+                        self._on_playback_end()
+                    except Exception as e:
+                        logger.exception(e)
 
     def enqueue_sound(self, path_or_data: Path):
         self.activate_check()

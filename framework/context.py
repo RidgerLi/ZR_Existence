@@ -131,7 +131,13 @@ class ZerolanLiveRobotContext:
         self.mic = SmartMicrophone(
             enable_vad=True,
             vad_mode=_config.system.microphone_vad_mode,
+            playback_tail_ms=_config.system.echo_suppression_tail_ms,
         )
+
+        # 半双工回声抑制：把扬声器的本地播放事件接到麦克风的门控上，
+        # 播放 TTS 期间关闭麦克风采集，避免机器人把自己输出的音频当成用户语音重新采集。
+        if _config.system.enable_echo_suppression:
+            self.speaker.set_playback_hooks(self.mic.begin_playback, self.mic.end_playback)
 
         # Headless system can not load `pynput` and `pygame`
         self.keyboard = None
