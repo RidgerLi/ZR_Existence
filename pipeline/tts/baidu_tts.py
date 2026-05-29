@@ -4,6 +4,7 @@ import requests
 from loguru import logger
 from pydantic import BaseModel
 from zerolan.data.pipeline.tts import TTSPrediction, TTSQuery
+from pipeline.tts.base_tts_impl import BaseTTSImpl
 
 
 def _aue_to_str(aue: int) -> str:
@@ -45,7 +46,7 @@ class BaiduTTSError(BaseModel):
     tts_logid: int
 
 
-class BaiduTTSPipeline:
+class BaiduTTSImpl(BaseTTSImpl):
     def __init__(self, api_key, secret_key):
         self._access_token = self._get_access_token(api_key, secret_key)
         self._cuid = str(uuid.uuid4())
@@ -60,7 +61,7 @@ class BaiduTTSPipeline:
         params = {"grant_type": "client_credentials", "client_id": api_key, "client_secret": secret_key}
         return str(requests.post(url, params=params).json().get("access_token"))
 
-    def predict(self, query: TTSQuery):
+    def predict(self, query: TTSQuery) -> TTSPrediction | None:
         url = "https://tsn.baidu.com/text2audio"
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',

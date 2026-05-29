@@ -65,8 +65,14 @@ class ASRSyncPipeline(CommonModelPipeline):
             return files, data
         elif isinstance(query, ASRStreamQuery):
             assert len(query.audio_data) > 0
-            files = {"audio": query.audio_data}
-            query.audio_data = ""
+            files = {
+                "audio": (
+                    f"audio.{query.media_type or 'raw'}",
+                    query.audio_data,
+                    "application/octet-stream",
+                )
+            }
+            query.audio_data = b""
             data = {"json": query.model_dump_json()}
 
             return files, data

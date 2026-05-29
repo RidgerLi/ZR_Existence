@@ -9,7 +9,7 @@ from loguru import logger
 from zerolan.data.data.prompt import TTSPrompt
 from zerolan.data.pipeline.asr import ASRStreamQuery
 from zerolan.data.pipeline.img_cap import ImgCapQuery
-from zerolan.data.pipeline.llm import LLMQuery, LLMPrediction
+from zerolan.data.pipeline.llm import LLMQuery, LLMPrediction, Conversation, RoleEnum
 from zerolan.data.pipeline.milvus import MilvusInsert, InsertRow, MilvusQuery
 from zerolan.data.pipeline.ocr import OCRQuery
 from zerolan.data.pipeline.tts import TTSQuery
@@ -50,6 +50,7 @@ class ZerolanLiveRobot(BaseBot):
         self.enable_exp_memory = _config.system.enable_intelligent_memory
         self.enable_sentiment_analysis = _config.system.enable_sentiment_analysis
         self.enable_split_by_punc = _config.system.enable_clause_split
+        self.enable_streaming_llm = _config.system.enable_streaming_llm
         self.subtitles_queue = Queue()
         self.init()
         logger.info("🤖 Zerolan Live Robot: Initialized services successfully.")
@@ -386,6 +387,11 @@ class ZerolanLiveRobot(BaseBot):
 
         @emitter.on(EventKeyRegistry.Pipeline.LLM)
         def llm_query_handler(event: PipelineOutputLLMEvent):
+            # NOTE: This handler only runs on the BLOCKING (non-streaming) LLM path,
+            # i.e. when the caller of `emit_llm_prediction` requested `direct_return`,
+            # or when `enable_streaming_llm`/`enable_clause_split` is False.
+            # The streaming voice path drives TTS directly inside
+            # `_emit_llm_prediction_streaming` and never emits this event.
             prediction = event.prediction
             text = prediction.response
             logger.info("LLM: " + text)
@@ -420,18 +426,24 @@ class ZerolanLiveRobot(BaseBot):
 
     def _tts_without_block(self, tts_prompt: TTSPrompt, text: str):
         def wrapper():
-            query = TTSQuery(
-                text=text,
-                text_language="auto",
-                refer_wav_path=tts_prompt.audio_path,
-                prompt_text=tts_prompt.prompt_text,
-                prompt_language=tts_prompt.lang,
-                audio_type="wav"
-            )
-            prediction = self.tts.predict(query=query)
-            logger.info(f"TTS: {query.text}")
+            # Runs inside a thread pool: any exception raised here is captured by the
+            # Future and would otherwise be swallowed silently (no log, no crash). We
+            # log it explicitly so TTS failures are always visible.
+            try:
+                query = TTSQuery(
+                    text=text,
+                    text_language="auto",
+                    refer_wav_path=tts_prompt.audio_path,
+                    prompt_text=tts_prompt.prompt_text,
+                    prompt_language=tts_prompt.lang,
+                    audio_type="wav"
+                )
+                prediction = self.tts.predict(query=query)
+                logger.info(f"TTS: {query.text}")
 
-            self.play_tts(PipelineOutputTTSEvent(prediction=prediction, transcript=text))
+                self.play_tts(PipelineOutputTTSEvent(prediction=prediction, transcript=text))
+            except Exception:
+                logger.exception(f"TTS failed for text: {text!r}")
 
         # To sync audio playing and subtitle
         self.tts_thread_pool.submit(wrapper)
@@ -460,6 +472,16 @@ class ZerolanLiveRobot(BaseBot):
 
     def emit_llm_prediction(self, text, direct_return: bool = False) -> None | LLMPrediction:
         logger.debug("`emit_llm_prediction` called")
+
+        # Streaming voice path: stream LLM tokens, dispatch each clause to TTS as soon as
+        # a punctuation mark is seen. This drastically lowers the time-to-first-speech
+        # (typically from ~16s down to ~5s on cloud LLMs). Only used when:
+        #   - the caller does NOT need the whole prediction back (no `direct_return`)
+        #   - clause-level split is enabled (otherwise streaming buys nothing)
+        #   - the streaming switch is enabled in config
+        if (not direct_return) and self.enable_split_by_punc and self.enable_streaming_llm:
+            return self._emit_llm_prediction_streaming(text)
+
         query = LLMQuery(text=text, history=self.llm_prompt_manager.current_history)
         prediction = self.llm.predict(query)
 
@@ -487,6 +509,99 @@ class ZerolanLiveRobot(BaseBot):
             emitter.emit(PipelineOutputLLMEvent(prediction=prediction))
             logger.debug("LLMEvent emitted.")
         return prediction
+
+    def _emit_llm_prediction_streaming(self, text: str) -> None:
+        """
+        Streaming voice path. Dispatches TTS as soon as a clause boundary is seen so that
+        speaking can start while the LLM is still generating later tokens.
+
+        Trade-offs vs. the blocking path:
+          - The TTS prompt is ALWAYS the default one. Per-utterance sentiment-based
+            prompt selection is intentionally skipped because it would gate the entire
+            pipeline on an extra synchronous LLM call.
+          - Filtering is applied per clause; if any clause matches a filter rule, the
+            already-dispatched clauses are NOT recalled (they may already be playing),
+            but no further clauses are queued and the chat history is NOT updated.
+          - `PipelineOutputLLMEvent` is NOT emitted: the streaming path drives TTS
+            directly to avoid the duplicate split/dispatch logic in `llm_query_handler`.
+        """
+        query = LLMQuery(text=text, history=self.llm_prompt_manager.current_history)
+        tts_prompt = self.tts_prompt_manager.default_tts_prompt
+
+        if self.cur_lang == Language.ZH:
+            cut_punc = "，。！？"
+        elif self.cur_lang == Language.JA:
+            cut_punc = "、。！？"
+        else:
+            cut_punc = ",.!?"
+
+        full_response = ""
+        buffer = ""
+        first_token_logged = False
+        aborted = False
+
+        for delta in self.llm.stream_predict(query):
+            if not first_token_logged:
+                logger.debug("LLM streaming: first delta received.")
+                first_token_logged = True
+            full_response += delta
+            buffer += delta
+
+            while True:
+                cut_pos = -1
+                for i, ch in enumerate(buffer):
+                    if ch in cut_punc:
+                        cut_pos = i
+                        break
+                if cut_pos < 0:
+                    break
+
+                clause = buffer[:cut_pos].strip().lstrip('\n')
+                buffer = buffer[cut_pos + 1:]
+                if not clause:
+                    continue
+
+                if self.filter.filter(clause):
+                    logger.warning(f"LLM (Filtered clause, abort streaming): {clause}")
+                    aborted = True
+                    break
+                if self.playground:
+                    self.playground.add_history(role="assistant", text=clause, username=self.bot_name)
+                self._tts_without_block(tts_prompt, clause)
+
+            if aborted:
+                break
+
+        if aborted:
+            return None
+
+        # Flush any trailing text without a closing punctuation mark.
+        tail = buffer.strip().lstrip('\n')
+        if tail:
+            if self.filter.filter(tail):
+                logger.warning(f"LLM (Filtered tail): {tail}")
+                return None
+            if self.playground:
+                self.playground.add_history(role="assistant", text=tail, username=self.bot_name)
+            self._tts_without_block(tts_prompt, tail)
+
+        full_response = full_response.lstrip('\n')
+        logger.info(f"LLM (stream): {full_response}")
+        logger.info(f"Length of current history: {len(self.llm_prompt_manager.current_history)}")
+
+        # Update chat history with the full response. The streaming generator does NOT
+        # touch `query.history`, so we have to do it here.
+        new_history = list(self.llm_prompt_manager.current_history)
+        new_history.append(Conversation(role=RoleEnum.user, content=text))
+        new_history.append(Conversation(role=RoleEnum.assistant, content=full_response))
+
+        if self.enable_exp_memory:
+            if self.exp_memory(text, False, full_response, len(full_response)):
+                self.llm_prompt_manager.reset_history(new_history)
+        else:
+            self.llm_prompt_manager.reset_history(new_history)
+
+        return None
 
     def change_lang(self, lang: Language):
         self.cur_lang = lang.name()

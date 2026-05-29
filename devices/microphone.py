@@ -13,12 +13,18 @@ from event.event_emitter import emitter
 
 
 class SmartMicrophone(ThreadRunnable):
-    def __init__(self, enable_vad: bool=False, vad_mode=3, frame_duration=30):
+    def __init__(self, enable_vad: bool = False, vad_mode=3, frame_duration=30,
+                 silence_hangover_ms: int = 700, min_speech_ms: int = 300):
         """
         初始化智能麦克风类
+        :param enable_vad: 是否启用 webrtcvad 进行语音端点检测。开启后讲话间隔超过
+                           `silence_hangover_ms` 才会判定为本句结束并发送 ASR。
         :param vad_mode: Optionally, set its aggressiveness mode, which is an integer between 0 and 3.
                          0 is the least aggressive about filtering out non-speech, 3 is the most aggressive.
         :param frame_duration: A frame must be either 10, 20, or 30 ms in duration.
+        :param silence_hangover_ms: 连续多少毫秒静音后才认为一句话说完，默认 700ms。
+        :param min_speech_ms: 一句话至少要有多少毫秒的语音帧才会被发出去，默认 300ms。
+                              用来过滤 VAD 抖动产生的噪声小段。
         """
         super().__init__()
         self._enable_vad = enable_vad
@@ -29,6 +35,11 @@ class SmartMicrophone(ThreadRunnable):
         self._channels = 1
         self._sample_rate = 16000
         self._chunk_size = int(self._sample_rate * frame_duration / 1000)  # Bytes
+        self._frame_duration = frame_duration
+
+        # 帧粒度的静音容忍 / 最低语音长度
+        self._silence_hangover_frames = max(1, silence_hangover_ms // frame_duration)
+        self._min_speech_frames = max(1, min_speech_ms // frame_duration)
 
         # Initialize microphone
         self._audio = pyaudio.PyAudio()
@@ -41,6 +52,9 @@ class SmartMicrophone(ThreadRunnable):
 
         self._audio_frames = []
         self._is_speaking = False
+        # VAD 计数：当前句中的 speech 帧数 / 末尾连续静音帧数
+        self._speech_frame_count = 0
+        self._silence_frame_count = 0
 
         # self._pause_event = threading.Event()
         self._stop_flag = False
@@ -90,21 +104,45 @@ class SmartMicrophone(ThreadRunnable):
 
     def _vad_record(self, data: bytes):
         if self._enable_vad:
-            if self._vad.is_speech(data, self._sample_rate):
+            is_speech = self._vad.is_speech(data, self._sample_rate)
+
+            if is_speech:
                 if not self._is_speaking:
                     logger.info("Voice detected: Beginning.")
                     self._is_speaking = True
+                    self._speech_frame_count = 0
                 self._audio_frames.append(data)
+                self._speech_frame_count += 1
+                self._silence_frame_count = 0
             else:
                 if self._is_speaking:
-                    logger.info("Voice detected: Ending.")
-                    self._is_speaking = False
-                    self._emit_event()
-                    self._audio_frames = []
+                    # 已经在讲话中：把静音帧也保留进来当作 hangover
+                    self._audio_frames.append(data)
+                    self._silence_frame_count += 1
+                    if self._silence_frame_count >= self._silence_hangover_frames:
+                        logger.info(
+                            f"Voice detected: Ending. (speech={self._speech_frame_count} frames, "
+                            f"silence_hangover={self._silence_frame_count} frames)"
+                        )
+                        if self._speech_frame_count >= self._min_speech_frames:
+                            self._emit_event()
+                        else:
+                            logger.debug(
+                                f"Speech too short ({self._speech_frame_count} frames < "
+                                f"{self._min_speech_frames}), drop."
+                            )
+                        self._reset_vad_state()
+                # 还没开始讲话：直接丢掉静音帧
         else:
             if not self._is_speaking:
                 self._is_speaking = True
             self._audio_frames.append(data)
+
+    def _reset_vad_state(self):
+        self._is_speaking = False
+        self._speech_frame_count = 0
+        self._silence_frame_count = 0
+        self._audio_frames = []
 
     def _emit_event(self):
         if self._audio_frames:
@@ -167,10 +205,8 @@ class SmartMicrophone(ThreadRunnable):
     def force_commit(self, is_emit=False):
         with self._recording_lock:
             if self._is_speaking and self._audio_frames and is_emit:
-                self._is_speaking = False
                 self._emit_event()
-            self._is_speaking = False
-            self._audio_frames = []
+            self._reset_vad_state()
 
 """
 # 备份代码，以免 self._vad 作用不佳，作用于 bot.py - on_service_vad_speech_chunk 函数中

@@ -1,3 +1,5 @@
+from typing import Generator
+
 from openai import OpenAI
 from requests import Response
 from typeguard import typechecked
@@ -21,15 +23,6 @@ def _to_openai_format(query: LLMQuery):
     return messages
 
 
-def _openai_predict(query: LLMQuery, wrapper):
-    messages = _to_openai_format(query)
-    completion = wrapper(messages)
-    resp = completion.choices[0].message.content
-    query.history.append(Conversation(role=RoleEnum.user, content=query.text))
-    query.history.append(Conversation(role=RoleEnum.assistant, content=resp))
-    return LLMPrediction(response=resp, history=query.history)
-
-
 class LLMSyncPipeline(CommonModelPipeline):
 
     def __init__(self, config: LLMPipelineConfig):
@@ -43,26 +36,60 @@ class LLMSyncPipeline(CommonModelPipeline):
             assert config.predict_url and config.stream_predict_url, "Please provide `predict_url` or `stream_predict_url`"
             base_url = config.predict_url if config.predict_url else config.stream_predict_url
             self._remote_model = OpenAI(api_key=config.api_key, base_url=base_url)
+            # Provider-specific options forwarded verbatim to every `chat.completions.create`
+            # call (both blocking and streaming). Only non-None values are collected so we
+            # never override the SDK's own defaults with an explicit None.
+            self._extra_kwargs = {}
+            if config.reasoning_effort is not None:
+                self._extra_kwargs["reasoning_effort"] = config.reasoning_effort
+            if config.extra_body is not None:
+                self._extra_kwargs["extra_body"] = config.extra_body
 
     @typechecked
     def predict(self, query: LLMQuery) -> LLMPrediction | None:
         assert isinstance(query, LLMQuery)
         if self._is_openai_format:
-            def wrapper(messages):
-                return self._remote_model.chat.completions.create(
-                    model=self.model_id,
-                    messages=messages,
-                )
-
-            return _openai_predict(query, wrapper)
+            messages = _to_openai_format(query)
+            completion = self._remote_model.chat.completions.create(
+                model=self.model_id,
+                messages=messages,
+                stream=False,
+                **self._extra_kwargs,
+            )
+            resp = completion.choices[0].message.content
+            query.history.append(Conversation(role=RoleEnum.user, content=query.text))
+            query.history.append(Conversation(role=RoleEnum.assistant, content=resp))
+            return LLMPrediction(response=resp, history=query.history)
         else:
             return super().predict(query)
 
     @typechecked
-    def stream_predict(self, query: LLMQuery, chunk_size: int | None = None):
+    def stream_predict(self, query: LLMQuery, chunk_size: int | None = None) -> Generator[str, None, None]:
+        """
+        Stream the LLM response. Yields incremental text deltas (str) as they arrive.
+
+        Important: this generator does NOT update `query.history`. Callers that need
+        history persistence should accumulate the deltas themselves and update the
+        chat history once the generator is exhausted.
+        """
         assert isinstance(query, LLMQuery)
-        # TODO: Kimi and Deepseek stream prediction.
-        return super().stream_predict(query)
+        if self._is_openai_format:
+            messages = _to_openai_format(query)
+            stream = self._remote_model.chat.completions.create(
+                model=self.model_id,
+                messages=messages,
+                stream=True,
+                **self._extra_kwargs,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if content:
+                    yield content
+        else:
+            yield from super().stream_predict(query, chunk_size=chunk_size)
 
     def parse_prediction(self, response: Response) -> LLMPrediction:
         json_val = response.content

@@ -59,3 +59,14 @@ class LLMPipelineConfig(AbstractPipelineConfig):
     stream_predict_url: str = Field(default="http://127.0.0.1:11000/llm/stream-predict",
                                     description="The URL for streaming LLM prediction requests. "
                                                 "Same semantics as `predict_url`.")
+    reasoning_effort: str | None = Field(default=None,
+                                         description="Only used when `openai_format=True`. Forwarded verbatim as the "
+                                                     "`reasoning_effort` parameter to the OpenAI-compatible SDK "
+                                                     "(e.g. `low` / `medium` / `high`). Leave as `null` to omit it.")
+    extra_body: dict | None = Field(default=None,
+                                    description="Only used when `openai_format=True`. Forwarded verbatim as the "
+                                                "`extra_body` parameter to the OpenAI-compatible SDK, for "
+                                                "provider-specific options not covered by the standard API.\n"
+                                                "Example (disable DeepSeek thinking mode): "
+                                                "{\"thinking\": {\"type\": \"disabled\"}}.\n"
+                                                "Leave as `null` to omit it.")

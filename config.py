@@ -21,8 +21,15 @@ class SystemConfig(BaseModel):
                                       description='If `True`, splits LLM responses into smaller clauses before sending to TTS service. '
                                                   'This enables faster audio generation and reduced latency for real-time applications. \n'
                                                   'Set to `False` to send full sentences as a single unit for more natural speech flow at the cost of longer wait times.')
+    enable_streaming_llm: bool = Field(default=True,
+                                       description='If `True`, the LLM response is streamed and clauses are dispatched to TTS as soon as a punctuation mark is seen. '
+                                                   'This drastically reduces the time-to-first-speech in voice-chat scenarios. '
+                                                   'When enabled, `enable_sentiment_analysis` is ignored on the streaming voice path '
+                                                   '(the default TTS prompt is used) because the sentiment LLM call would otherwise re-serialize the whole pipeline. \n'
+                                                   'Set to `False` to keep the legacy blocking behavior (slower but compatible with sentiment-based prompt selection).')
     enable_sentiment_analysis: bool = Field(default=False, description='Automatically analyzes sentiment to select appropriate TTS prompts. '
-                                                                      'This also increases token consumption and adds slight latency due to extra processing.')
+                                                                      'This also increases token consumption and adds slight latency due to extra processing. '
+                                                                      'Has no effect on the streaming voice path when `enable_streaming_llm` is True.')
     enable_intelligent_memory: bool = Field(default=False,
                                             description='🧪 EXPERIMENTAL: Automatically scores and filters conversation history entries based on sentiment, relevance, and safety.')
 

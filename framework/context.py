@@ -128,7 +128,10 @@ class ZerolanLiveRobotContext:
             from services.qqbot.napcat import QQBotService
 
             self.qq: QQBotService = QQBotService(_config.service.qqbot)
-        self.mic = SmartMicrophone(vad_mode=_config.system.microphone_vad_mode)
+        self.mic = SmartMicrophone(
+            enable_vad=True,
+            vad_mode=_config.system.microphone_vad_mode,
+        )
 
         # Headless system can not load `pynput` and `pygame`
         self.keyboard = None
