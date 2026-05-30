@@ -15,8 +15,8 @@ from event.event_emitter import emitter
 
 class SmartMicrophone(ThreadRunnable):
     def __init__(self, enable_vad: bool = False, vad_mode=3, frame_duration=30,
-                 silence_hangover_ms: int = 700, min_speech_ms: int = 500,
-                 playback_tail_ms: int = 500):
+                 silence_hangover_ms: int = 800, min_speech_ms: int = 1000,
+                 playback_tail_ms: int = 400):
         """
         初始化智能麦克风类
         :param enable_vad: 是否启用 webrtcvad 进行语音端点检测。开启后讲话间隔超过
