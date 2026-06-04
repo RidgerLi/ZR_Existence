@@ -1,5 +1,7 @@
 import asyncio
 import os
+import threading
+import time
 from concurrent.futures.thread import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
@@ -33,6 +35,7 @@ from event.event_data import DeviceMicrophoneVADEvent, DeviceKeyboardPressEvent,
 from event.event_emitter import emitter
 from event.registry import EventKeyRegistry
 from framework.base_bot import BaseBot
+from framework.conversation_state import ConversationState
 from manager.config_manager import get_config
 from pipeline.ocr.ocr_sync import avg_confidence, stringify
 
@@ -52,6 +55,16 @@ class ZerolanLiveRobot(BaseBot):
         self.enable_split_by_punc = _config.system.enable_clause_split
         self.enable_streaming_llm = _config.system.enable_streaming_llm
         self.subtitles_queue = Queue()
+
+        # 对话轮次管理：把"AI 是否在忙"的状态集中起来，避免常开语音时一句话被 VAD 切碎后
+        # 并发触发多次回复（详见 framework/conversation_state.py）。延迟优先：ASR 文字一出来
+        # 就直接进轮次锁，不做去抖等待——空闲立刻回，忙则缓存到下一轮。
+        self.enable_turn_taking = _config.system.enable_turn_taking
+        self.conv_state = ConversationState()
+        self.conv_state.set_speaker_busy_probe(self.speaker.is_busy)
+        # 同一时刻只允许一个轮次进入 LLM；其余输入被缓存到下一轮。
+        self._turn_lock = threading.Lock()
+
         self.init()
         logger.info("🤖 Zerolan Live Robot: Initialized services successfully.")
 
@@ -66,6 +79,13 @@ class ZerolanLiveRobot(BaseBot):
             if _config.system.default_enable_microphone:
                 vad_thread = KillableThread(target=self.mic.start, daemon=True, name="VADThread")
                 threads.append(vad_thread)
+
+            if self.enable_turn_taking:
+                # 轮次调度循环：AI 空闲下来后，把"忙碌期间缓存的用户输入"合并成一句补发。
+                # 这是后续 Phase 2 决策循环（DecisionLoop）的雏形。
+                turn_thread = KillableThread(target=self._turn_dispatch_loop, daemon=True,
+                                             name="TurnDispatchLoop")
+                threads.append(turn_thread)
 
             if self.keyboard is not None:
                 keyboard_thread = KillableThread(target=self.keyboard.start, daemon=True, name="KeyboardThread")
@@ -216,7 +236,11 @@ class ZerolanLiveRobot(BaseBot):
         def asr_handler(event: PipelineASREvent):
             logger.debug("`ASREvent` received.")
             prediction = event.prediction
-            self.emit_llm_prediction(prediction.transcript)
+            if self.enable_turn_taking:
+                # 延迟优先：文字一出来就交给轮次锁统一调度——空闲立刻触发 LLM，忙则缓存到下一轮。
+                self._dispatch_user_utterance(prediction.transcript)
+            else:
+                self.emit_llm_prediction(prediction.transcript)
 
             # TODO 关闭额外功能，只保留llm回复功能
             # if self.playground:
@@ -294,7 +318,11 @@ class ZerolanLiveRobot(BaseBot):
         @emitter.on(EventKeyRegistry.LiveStream.DANMAKU)
         def on_danmaku(event: LiveStreamDanmakuEvent):
             text = f"你收到了一条弹幕，用户“{event.danmaku.username}”说：\n{event.danmaku.content}"
-            self.emit_llm_prediction(text)
+            if self.enable_turn_taking:
+                # 弹幕也走轮次锁：AI 忙时缓存到下一轮，避免和语音回复互相打架。
+                self._dispatch_user_utterance(text)
+            else:
+                self.emit_llm_prediction(text)
 
         # @emitter.on(EventKeyRegistry.System.SECOND)
         # async def on_second_danmaku_check(event: SecondEvent):
@@ -428,6 +456,10 @@ class ZerolanLiveRobot(BaseBot):
                 self.obs.subtitle(text, which="assistant", duration=math_util.clamp(0, 5, duration - 1))
 
     def _tts_without_block(self, tts_prompt: TTSPrompt, text: str):
+        # 在途 TTS 计数 +1：让 `is_ai_busy()` 在子句还没生成/播放完之前持续返回 True，
+        # 这样轮次锁不会在机器人话还没说完时就放下一轮进来。
+        self.conv_state.tts_submitted()
+
         def wrapper():
             # Runs inside a thread pool: any exception raised here is captured by the
             # Future and would otherwise be swallowed silently (no log, no crash). We
@@ -447,6 +479,10 @@ class ZerolanLiveRobot(BaseBot):
                 self.play_tts(PipelineOutputTTSEvent(prediction=prediction, transcript=text))
             except Exception:
                 logger.exception(f"TTS failed for text: {text!r}")
+            finally:
+                # 子句已派发到本地扬声器队列（或已失败）。此时再 -1；剩余的播放时长由
+                # ConversationState 的扬声器探针（speaker.is_busy）继续覆盖。
+                self.conv_state.tts_done()
 
         # To sync audio playing and subtitle
         self.tts_thread_pool.submit(wrapper)
@@ -472,6 +508,67 @@ class ZerolanLiveRobot(BaseBot):
             r = 1
         t_memory = 0.3 * (l_max - len_history) / l_max + 0.2 * s + 0.2 * b + 0.1 * r
         return t_memory > 0.5
+
+    def _dispatch_user_utterance(self, text: str) -> None:
+        """轮次锁入口：决定"现在这句话能不能马上回复"。
+
+        - AI 正忙（思考中 / 还有 TTS 在播）：把这句话缓存进 pending，等当前一轮说完后由
+          `_turn_dispatch_loop` 合并补发，绝不并发开第二个 LLM。
+        - AI 空闲：原子地占据本轮（begin_thinking），然后真正调用 LLM。
+        """
+        if not self.enable_turn_taking:
+            self.emit_llm_prediction(text)
+            return
+
+        text = (text or "").strip()
+        if not text:
+            return
+
+        with self._turn_lock:
+            if self.conv_state.is_ai_busy():
+                logger.info(f"AI busy, buffer utterance for next turn: {text}")
+                self.conv_state.push_pending(text)
+                return
+            # 占据本轮：在锁内置 thinking，确保并发到来的其它输入会看到"忙"。
+            self.conv_state.begin_thinking()
+
+        self._run_turn(text)
+
+    def _run_turn(self, text: str) -> None:
+        """真正执行一轮回复。调用方必须已经通过 `begin_thinking` 占据了本轮。"""
+        try:
+            self.emit_llm_prediction(text)
+        except Exception as e:
+            logger.exception(e)
+        finally:
+            # LLM 生成结束。注意此时 TTS 可能仍在生成/播放：is_ai_busy 会因为在途 TTS 计数
+            # 和扬声器探针继续为真，pending 输入会等到真正播完后才在调度循环里补发。
+            self.conv_state.end_thinking()
+
+    def _turn_dispatch_loop(self) -> None:
+        """轮次调度循环（Phase 2 决策循环的雏形）。
+
+        每 ~150ms 看一眼：AI 是否已经彻底空闲？若空闲且有缓存输入，则合并补发一轮。
+        """
+        while self._timer_flag:
+            time.sleep(0.15)
+            try:
+                if self.conv_state.is_ai_busy():
+                    continue
+                if not self.conv_state.has_pending():
+                    continue
+                with self._turn_lock:
+                    # 双重检查：拿到锁后再确认仍然空闲且仍有 pending。
+                    if self.conv_state.is_ai_busy():
+                        continue
+                    merged = self.conv_state.drain_pending()
+                    if not merged:
+                        continue
+                    self.conv_state.begin_thinking()
+                logger.info(f"Turn dispatch: flush buffered utterance(s): {merged}")
+                self._run_turn(merged)
+            except Exception as e:
+                logger.exception(e)
 
     def emit_llm_prediction(self, text, direct_return: bool = False) -> None | LLMPrediction:
         logger.debug("`emit_llm_prediction` called")

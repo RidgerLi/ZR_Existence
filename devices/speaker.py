@@ -90,7 +90,29 @@ class Speaker(ThreadRunnable):
 
     def stop_now(self):
         pygame.mixer.stop()
+        try:
+            pygame.mixer.music.stop()
+        except Exception as e:
+            logger.exception(e)
         self.audio_clips = Queue()
+        self._semaphore.clear()
+
+    def is_busy(self) -> bool:
+        """本地扬声器是否仍在出声：队列里还有待播片段，或当前正在播放。
+
+        用于对话轮次管理判定"AI 是否还在说话"。远程播放（playground）不走本地扬声器，
+        此时返回 False 是预期行为。
+        """
+        try:
+            clips = self.audio_clips
+            if clips is not None and not clips.empty():
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(pygame.mixer.music.get_busy())
+        except Exception:
+            return False
 
     @staticmethod
     def playsound(path: Path, block: bool = True):

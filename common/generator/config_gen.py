@@ -34,7 +34,9 @@ class ConfigFileGenerator:
                 self._gen(field_val, depth + 1)
             else:
                 self._add_comments(field_info, depth)
-                if isinstance(type(field_val), type(Enum)):
+                if field_val is None:
+                    self._yaml_str += self._get_indent(depth) + f"{field_name}: null\n"
+                elif isinstance(type(field_val), type(Enum)):
                     self._yaml_str += self._get_indent(depth) + f"{field_name}: '{field_val.value}'\n"
                 elif isinstance(field_val, str):
                     self._yaml_str += self._get_indent(depth) + f"{field_name}: '{field_val}'\n"

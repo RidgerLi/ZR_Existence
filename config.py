@@ -41,6 +41,12 @@ class SystemConfig(BaseModel):
                                                                       'Has no effect on the streaming voice path when `enable_streaming_llm` is True.')
     enable_intelligent_memory: bool = Field(default=False,
                                             description='🧪 EXPERIMENTAL: Automatically scores and filters conversation history entries based on sentiment, relevance, and safety.')
+    enable_turn_taking: bool = Field(default=True,
+                                     description='Conversation turn-taking management for always-on voice chat. When `True`, the bot serializes '
+                                                 'replies: anything the user says while the bot is still thinking/speaking is buffered and answered on '
+                                                 'the next turn instead of triggering overlapping, self-talking replies. Latency-first: an ASR '
+                                                 'transcript is dispatched to the LLM immediately when the bot is idle (no debounce/coalescing wait). '
+                                                 'Strongly recommended when the microphone stays open continuously.')
 
 
 class ZerolanLiveRobotConfig(BaseModel):
