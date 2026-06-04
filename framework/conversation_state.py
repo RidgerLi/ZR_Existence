@@ -80,6 +80,10 @@ class ConversationState:
         with self._lock:
             self._ai_thinking = False
 
+    def is_thinking(self) -> bool:
+        with self._lock:
+            return self._ai_thinking
+
     # ---- 在途 TTS 计数 -----------------------------------------------------
     def tts_submitted(self) -> None:
         with self._lock:

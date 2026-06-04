@@ -1,3 +1,5 @@
+import time
+from collections import deque
 from typing import Union
 
 from common.concurrent.abs_runnable import ThreadRunnable
@@ -38,6 +40,12 @@ class SmartKeyboard(ThreadRunnable):
         # 外部环境可用的锁
         self.microphone_state_lock = threading.Lock()
 
+        # 全局敲击时间戳（供大脑感知层判定"专注打字"做模式自动感知）。
+        # 记录所有按键（不止热键），按滑动窗口统计频率。
+        self._key_times: deque = deque()
+        self._key_times_lock = threading.Lock()
+        self._key_times_window_s = 60.0
+
     def start(self):
         super().start()
         try:
@@ -51,6 +59,9 @@ class SmartKeyboard(ThreadRunnable):
     
     def _on_key_press(self, key):
         # logger.debug(f'Press {key}')
+        # 先记录全局敲击（所有按键），用于活跃度统计。
+        self._record_keystroke()
+
         if key not in self._hotkeys:
             return
         
@@ -67,6 +78,21 @@ class SmartKeyboard(ThreadRunnable):
             self._toggle_debounce = False
             self._current_hotkey = None
     
+    def _record_keystroke(self):
+        now = time.monotonic()
+        with self._key_times_lock:
+            self._key_times.append(now)
+            cutoff = now - self._key_times_window_s
+            while self._key_times and self._key_times[0] < cutoff:
+                self._key_times.popleft()
+
+    def recent_keystroke_count(self, window_s: float = 30.0) -> int:
+        """返回最近 window_s 秒内的全局敲击次数（供大脑模式自动感知）。"""
+        now = time.monotonic()
+        cutoff = now - min(window_s, self._key_times_window_s)
+        with self._key_times_lock:
+            return sum(1 for t in self._key_times if t >= cutoff)
+
     def name(self):
         return "SmartKeyboard"
     

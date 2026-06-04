@@ -36,6 +36,11 @@ from event.event_emitter import emitter
 from event.registry import EventKeyRegistry
 from framework.base_bot import BaseBot
 from framework.conversation_state import ConversationState
+from framework.brain.brain import Brain
+from framework.brain.drives import DriveSystem
+from framework.brain.perception import (Perception, MicEnergySensor, VadSensor,
+                                        KeyboardActivitySensor, TimeSilenceSensor,
+                                        CameraMotionSensor, MemoryUrgeSensor)
 from manager.config_manager import get_config
 from pipeline.ocr.ocr_sync import avg_confidence, stringify
 
@@ -64,6 +69,15 @@ class ZerolanLiveRobot(BaseBot):
         self.conv_state.set_speaker_busy_probe(self.speaker.is_busy)
         # 同一时刻只允许一个轮次进入 LLM；其余输入被缓存到下一轮。
         self._turn_lock = threading.Lock()
+        # 轮次执行器：让"大脑"决定开口后把这一轮的 LLM 放到后台跑，大脑循环可继续 tick
+        # （感知/内驱/面板不被一轮长回复阻塞）。单线程，保证轮次串行。
+        self._turn_executor = ThreadPoolExecutor(max_workers=1)
+
+        # LLM 之前的"大脑"：感知 → 多内驱 → 决策（被动响应 / 主动开口）。
+        self._proactive_prompt = _config.system.brain.proactive_prompt
+        self.brain: Brain | None = None
+        if self.enable_turn_taking and _config.system.brain.enable:
+            self._build_brain()
 
         self.init()
         logger.info("🤖 Zerolan Live Robot: Initialized services successfully.")
@@ -81,11 +95,17 @@ class ZerolanLiveRobot(BaseBot):
                 threads.append(vad_thread)
 
             if self.enable_turn_taking:
-                # 轮次调度循环：AI 空闲下来后，把"忙碌期间缓存的用户输入"合并成一句补发。
-                # 这是后续 Phase 2 决策循环（DecisionLoop）的雏形。
-                turn_thread = KillableThread(target=self._turn_dispatch_loop, daemon=True,
-                                             name="TurnDispatchLoop")
-                threads.append(turn_thread)
+                if self.brain is not None:
+                    # 大脑决策循环：感知 → 多内驱 → 决策（被动响应 + 主动开口）。
+                    brain_thread = KillableThread(
+                        target=lambda: self.brain.run(lambda: self._timer_flag),
+                        daemon=True, name="BrainLoop")
+                    threads.append(brain_thread)
+                else:
+                    # 退化：仅做 pending 补发，无主动开口。
+                    turn_thread = KillableThread(target=self._turn_dispatch_loop, daemon=True,
+                                                 name="TurnDispatchLoop")
+                    threads.append(turn_thread)
 
             if self.keyboard is not None:
                 keyboard_thread = KillableThread(target=self.keyboard.start, daemon=True, name="KeyboardThread")
@@ -199,9 +219,11 @@ class ZerolanLiveRobot(BaseBot):
                                 self.mic.set_talk_enabled_event()
                     else:
                         logger.info(f'Microphone is disabled at config.yaml')
-                elif False:
-                    # example
-                    pass
+                elif self.brain is not None and event.hotkey == _config.system.brain.mode_hotkey:
+                    # 切换"安静模式"：按一下进安静(focus)，再按一下恢复之前的模式。
+                    # 比语音命令可靠——语音拦截要求 ASR 输出与短语逐字匹配，现实中难以保证。
+                    new_mode = self.brain.toggle_quiet()
+                    self._announce_mode(new_mode)
             except Exception as e:
                 logger.exception(e)
 
@@ -509,6 +531,132 @@ class ZerolanLiveRobot(BaseBot):
         t_memory = 0.3 * (l_max - len_history) / l_max + 0.2 * s + 0.2 * b + 0.1 * r
         return t_memory > 0.5
 
+    def _history_for_query(self):
+        """构造发给 LLM 的历史：在干净历史基础上，瞬态拼入大脑的"内部状态"system 片段。
+
+        返回的是一份拷贝；持久化历史（current_history）不受影响，所以状态描述不会堆进历史。
+        """
+        history = self.llm_prompt_manager.current_history
+        if self.brain is None or not _config.system.brain.inject_state_to_prompt:
+            return history
+        suffix = self.brain.state_prompt()
+        if not suffix:
+            return history
+        new = [Conversation(role=c.role, content=c.content) for c in history]
+        if new and new[0].role == RoleEnum.system:
+            new[0] = Conversation(role=RoleEnum.system,
+                                  content=new[0].content + "\n\n" + suffix)
+        else:
+            new.insert(0, Conversation(role=RoleEnum.system, content=suffix))
+        return new
+
+    def _build_brain(self) -> None:
+        """构建大脑：装配感知层（现有硬件传感器）、多内驱系统与决策循环。"""
+        bcfg = _config.system.brain
+
+        perception = Perception()
+        # 现有硬件传感器
+        perception.add(MicEnergySensor(energy_probe=self.mic.current_energy))
+        perception.add(VadSensor(speaking_probe=self.mic.is_user_speaking))
+        if self.keyboard is not None:
+            perception.add(KeyboardActivitySensor(
+                count_probe=lambda: self.keyboard.recent_keystroke_count(bcfg.keyboard_window_s),
+                busy_count=bcfg.keyboard_busy_count,
+            ))
+        else:
+            # 无键盘（如 headless）：通道占位但离线，自动感知会退回 normal 档。
+            perception.add(KeyboardActivitySensor(count_probe=lambda: None,
+                                                  busy_count=bcfg.keyboard_busy_count,
+                                                  enabled=False))
+        perception.add(TimeSilenceSensor(idle_probe=self.conv_state.idle_seconds,
+                                         full_silence_s=bcfg.silence_full_s))
+        # 预留接口：摄像头 / 记忆（现在离线，Phase 3 / 接摄像头时替换 probe 即可）
+        perception.add(CameraMotionSensor(enabled=False))
+        perception.add(MemoryUrgeSensor(enabled=False))
+
+        self.brain = Brain(
+            conv_state=self.conv_state,
+            perception=perception,
+            drive_system=DriveSystem(),
+            reactive_cb=self._brain_reactive,
+            proactive_cb=self._brain_proactive,
+            mode=bcfg.mode,
+            tick_interval=bcfg.tick_interval,
+            auto_focus_kb_hi=bcfg.auto_focus_kb_hi,
+            auto_companion_kb_lo=bcfg.auto_companion_kb_lo,
+            auto_companion_silence=bcfg.auto_companion_silence,
+            hysteresis_ticks=bcfg.hysteresis_ticks,
+            enable_proactive=bcfg.enable_proactive,
+        )
+        logger.info(f"🧠 Brain initialized (mode={bcfg.mode}, proactive={bcfg.enable_proactive}).")
+
+    def _brain_reactive(self) -> bool:
+        """大脑回调：AI 空闲时把缓存的用户输入合并补发一轮。返回是否真的派发。"""
+        with self._turn_lock:
+            if self.conv_state.is_ai_busy():
+                return False
+            merged = self.conv_state.drain_pending()
+            if not merged:
+                return False
+            self.conv_state.begin_thinking()
+        logger.info(f"Brain reactive: flush buffered utterance(s): {merged}")
+        self._turn_executor.submit(self._run_turn, merged)
+        return True
+
+    def _brain_proactive(self) -> bool:
+        """大脑回调：主动开口。返回是否真的派发。"""
+        with self._turn_lock:
+            if self.conv_state.is_ai_busy():
+                return False
+            self.conv_state.begin_thinking()
+        logger.info("Brain proactive: initiating conversation.")
+        self._turn_executor.submit(self._run_proactive_turn)
+        return True
+
+    def _run_proactive_turn(self) -> None:
+        """执行一轮主动开口。用 proactive prompt 生成，但不把该提示写进对话历史。"""
+        try:
+            self._emit_llm_prediction_streaming(self._proactive_prompt, persist_user=False)
+        except Exception as e:
+            logger.exception(e)
+        finally:
+            self.conv_state.end_thinking()
+
+    def _try_switch_mode_by_voice(self, text: str) -> bool:
+        """语音模式命令拦截。命中则切换模式并返回 True（该句不再送 LLM）。"""
+        if self.brain is None or not _config.system.brain.enable_voice_mode_command:
+            return False
+        t = text.strip()
+        mapping = {
+            "专注模式": "focus", "进入专注模式": "focus", "安静一点": "focus", "安静一会儿": "focus",
+            "普通模式": "normal", "正常模式": "normal",
+            "陪我聊天": "companion", "陪聊模式": "companion", "陪伴模式": "companion", "活跃一点": "companion",
+            "自动模式": "auto", "你自己看着办": "auto",
+        }
+        target = mapping.get(t)
+        if target is None:
+            return False
+        self.brain.set_mode(target)
+        self._announce_mode(target)
+        return True
+
+    def _announce_mode(self, mode: str) -> None:
+        if not _config.system.brain.announce_mode_switch:
+            return
+        lines = {
+            "focus": "好的，我先安静会儿，你忙完叫我。",
+            "normal": "好，恢复普通模式啦。",
+            "companion": "好耶，那我多陪你聊聊天~",
+            "auto": "好的，我自己看情况啦。",
+        }
+        line = lines.get(mode)
+        if not line or self.tts_prompt_manager is None:
+            return
+        try:
+            self._tts_without_block(self.tts_prompt_manager.default_tts_prompt, line)
+        except Exception as e:
+            logger.exception(e)
+
     def _dispatch_user_utterance(self, text: str) -> None:
         """轮次锁入口：决定"现在这句话能不能马上回复"。
 
@@ -522,6 +670,10 @@ class ZerolanLiveRobot(BaseBot):
 
         text = (text or "").strip()
         if not text:
+            return
+
+        # 语音模式命令拦截（"专注模式""陪我聊天"等），命中则不送 LLM。
+        if self._try_switch_mode_by_voice(text):
             return
 
         with self._turn_lock:
@@ -610,10 +762,14 @@ class ZerolanLiveRobot(BaseBot):
             logger.debug("LLMEvent emitted.")
         return prediction
 
-    def _emit_llm_prediction_streaming(self, text: str) -> None:
+    def _emit_llm_prediction_streaming(self, text: str, persist_user: bool = True) -> None:
         """
         Streaming voice path. Dispatches TTS as soon as a clause boundary is seen so that
         speaking can start while the LLM is still generating later tokens.
+
+        `persist_user=False` is used by proactive speech: the prompt handed to the LLM is a
+        system-style nudge, so we generate from it but do NOT store it as a user turn in the
+        chat history (only the assistant's spontaneous reply is persisted).
 
         Trade-offs vs. the blocking path:
           - The TTS prompt is ALWAYS the default one. Per-utterance sentiment-based
@@ -625,7 +781,7 @@ class ZerolanLiveRobot(BaseBot):
           - `PipelineOutputLLMEvent` is NOT emitted: the streaming path drives TTS
             directly to avoid the duplicate split/dispatch logic in `llm_query_handler`.
         """
-        query = LLMQuery(text=text, history=self.llm_prompt_manager.current_history)
+        query = LLMQuery(text=text, history=self._history_for_query())
         tts_prompt = self.tts_prompt_manager.default_tts_prompt
 
         if self.cur_lang == Language.ZH:
@@ -692,7 +848,8 @@ class ZerolanLiveRobot(BaseBot):
         # Update chat history with the full response. The streaming generator does NOT
         # touch `query.history`, so we have to do it here.
         new_history = list(self.llm_prompt_manager.current_history)
-        new_history.append(Conversation(role=RoleEnum.user, content=text))
+        if persist_user:
+            new_history.append(Conversation(role=RoleEnum.user, content=text))
         new_history.append(Conversation(role=RoleEnum.assistant, content=full_response))
 
         if self.enable_exp_memory:

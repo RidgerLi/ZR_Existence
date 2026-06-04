@@ -132,6 +132,7 @@ class ZerolanLiveRobotContext:
             enable_vad=True,
             vad_mode=_config.system.microphone_vad_mode,
             playback_tail_ms=_config.system.echo_suppression_tail_ms,
+            energy_ref=_config.system.brain.mic_energy_ref,
         )
 
         # 半双工回声抑制：把扬声器的本地播放事件接到麦克风的门控上，
@@ -143,7 +144,13 @@ class ZerolanLiveRobotContext:
         self.keyboard = None
         if not is_headless():
             from devices.keyboard import SmartKeyboard
-            self.keyboard = SmartKeyboard(hotkeys=[_config.system.microphone_hotkey])
+            hotkeys = [_config.system.microphone_hotkey]
+            # 大脑启用时，额外监听切换主动开口模式的热键。
+            if _config.system.brain.enable and _config.system.enable_turn_taking:
+                mode_hotkey = _config.system.brain.mode_hotkey
+                if mode_hotkey and mode_hotkey != _config.system.microphone_hotkey:
+                    hotkeys.append(mode_hotkey)
+            self.keyboard = SmartKeyboard(hotkeys=hotkeys)
         if _config.service.obs.enable:
             self.obs = ObsStudioWsClient(_config.service.obs)
         self.config_page = DynamicConfigPage(_config)

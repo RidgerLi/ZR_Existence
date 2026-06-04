@@ -3,6 +3,7 @@ import threading
 import time
 import wave
 
+import numpy as np
 import pyaudio
 import webrtcvad
 from loguru import logger
@@ -16,7 +17,7 @@ from event.event_emitter import emitter
 class SmartMicrophone(ThreadRunnable):
     def __init__(self, enable_vad: bool = False, vad_mode=3, frame_duration=30,
                  silence_hangover_ms: int = 800, min_speech_ms: int = 1000,
-                 playback_tail_ms: int = 400):
+                 playback_tail_ms: int = 400, energy_ref: float = 3000.0):
         """
         初始化智能麦克风类
         :param enable_vad: 是否启用 webrtcvad 进行语音端点检测。开启后讲话间隔超过
@@ -60,6 +61,12 @@ class SmartMicrophone(ThreadRunnable):
         # VAD 计数：当前句中的 speech 帧数 / 末尾连续静音帧数
         self._speech_frame_count = 0
         self._silence_frame_count = 0
+
+        # 麦克风能量 EMA（供大脑感知层的 MicEnergySensor 轮询）。
+        # 在非播放抑制帧上计算 RMS 并做指数滑动平均，捕捉"环境有动静"（含非人声）。
+        self._energy_ref = max(1.0, energy_ref)
+        self._energy_ema = 0.0
+        self._energy_alpha = 0.25
 
         # self._pause_event = threading.Event()
         self._stop_flag = False
@@ -145,6 +152,9 @@ class SmartMicrophone(ThreadRunnable):
                 self._reset_vad_state()
             return
 
+        # 更新能量 EMA（仅在非抑制帧上，避免把机器人自己的声音算进环境能量）。
+        self._update_energy(data)
+
         if self._enable_vad:
             is_speech = self._vad.is_speech(data, self._sample_rate)
 
@@ -179,6 +189,33 @@ class SmartMicrophone(ThreadRunnable):
             if not self._is_speaking:
                 self._is_speaking = True
             self._audio_frames.append(data)
+
+    def _update_energy(self, data: bytes):
+        try:
+            arr = np.frombuffer(data, dtype=np.int16)
+            if arr.size == 0:
+                return
+            rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+            self._energy_ema = self._energy_alpha * rms + (1 - self._energy_alpha) * self._energy_ema
+        except Exception as e:
+            logger.exception(e)
+
+    def current_energy(self):
+        """供大脑感知层轮询：返回归一化 [0,1] 的麦克风能量；麦克风未采集时返回 None。"""
+        if not self.is_recording:
+            return None
+        v = self._energy_ema / self._energy_ref
+        if v < 0.0:
+            return 0.0
+        if v > 1.0:
+            return 1.0
+        return v
+
+    def is_user_speaking(self):
+        """供大脑感知层轮询：用户当前是否正在说话（VAD 判定中）。麦克风未采集时返回 None。"""
+        if not self.is_recording:
+            return None
+        return self._is_speaking
 
     def _reset_vad_state(self):
         self._is_speaking = False
