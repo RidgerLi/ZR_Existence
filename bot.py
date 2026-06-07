@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import threading
 import time
 from concurrent.futures.thread import ThreadPoolExecutor
@@ -18,7 +19,7 @@ from zerolan.data.pipeline.tts import TTSQuery
 from zerolan.data.pipeline.vla import ShowUiQuery
 
 from agent.api import sentiment_analyse, translate, summary_history, find_file, model_scale, sentiment_score, \
-    memory_score
+    memory_score, update_user_impression
 from common.concurrent.abs_runnable import stop_all_runnable
 from common.concurrent.killable_thread import KillableThread, kill_all_threads
 from common.enumerator import Language
@@ -41,7 +42,12 @@ from framework.brain.drives import DriveSystem
 from framework.brain.perception import (Perception, MicEnergySensor, VadSensor,
                                         KeyboardActivitySensor, TimeSilenceSensor,
                                         CameraMotionSensor, MemoryUrgeSensor)
+from framework.memory.memory_manager import MemoryManager
+from framework.memory.memory_store import MemoryStore, MemoryState
+from framework.memory.self_state import SelfState
+from framework.memory.self_update import ToolRegistry, extract_and_strip, MARKER_OPEN
 from manager.config_manager import get_config
+from manager.prompt_composer import PromptComposer
 from pipeline.ocr.ocr_sync import avg_confidence, stringify
 
 _config = get_config()
@@ -75,15 +81,76 @@ class ZerolanLiveRobot(BaseBot):
 
         # LLM 之前的"大脑"：感知 → 多内驱 → 决策（被动响应 / 主动开口）。
         self._proactive_prompt = _config.system.brain.proactive_prompt
+        # 主动开口（proactive）产生的 AI 发言先暂存这里，不直接进短期历史；只有当用户随后真的
+        # 回复时，才把"这条主动发言 + 用户回复"一起补进历史。否则会被无人应答的自言自语填满。
+        self._pending_proactive: Conversation | None = None
         self.brain: Brain | None = None
         if self.enable_turn_taking and _config.system.brain.enable:
             self._build_brain()
 
+        # 分层记忆：工作窗口（current_history，由 max_history 滑动窗口控制）之外，
+        # 被裁掉的真实对话交给 MemoryManager 做后台会话摘要（L3b）与长期入库（L2b）。
+        self._long_term_memory: str = ""
+        self._long_term_query: str = ""    # 上次用于检索的 query（监控用）
+        self._long_term_hits: list = []    # 上次检索命中：[{text, distance}]（监控用）
+        self._current_user_text: str = ""  # 最近一轮用户输入，供 L2b 长期记忆按语义检索
+        self._mem_cfg = _config.system.memory
+        self.memory = MemoryManager(
+            light_interval_s=self._mem_cfg.light_interval_s,
+            light_min_pending=self._mem_cfg.light_min_pending,
+            heavy_interval_s=self._mem_cfg.heavy_interval_s,
+            long_term_threshold=self._mem_cfg.long_term_threshold,
+            hot_window_size=self._mem_cfg.hot_window_size,
+            recent_digest_interval_s=self._mem_cfg.recent_digest_interval_s,
+            archive_sink=self._archive_to_vecdb,
+        )
+        if self._mem_cfg.enable:
+            self.llm_prompt_manager.set_evict_callback(self.memory.enqueue_evicted)
+            # 温区"近期回顾"按当前工作窗口的较早段重建。
+            self.memory.set_live_turns_provider(self.llm_prompt_manager.live_turns)
+
+        # 对话历史 + 会话摘要 + 对用户的印象 + 计数器的磁盘持久化（resources/memory/memory.md）：
+        # 启动时载入工作窗口，运行中每轮由后台 IO 线程异步写回。
+        self.memory_store = MemoryStore(os.path.join("resources", "memory", "memory.md"))
+        _loaded = self.memory_store.load()
+        if _loaded.turns:
+            self.llm_prompt_manager.seed_live_turns(_loaded.turns)
+        if _loaded.session_summary:
+            self.memory.session_summary = _loaded.session_summary
+        if _loaded.recent_digest:
+            self.memory.recent_digest = _loaded.recent_digest
+        # 对用户的印象（顶层 syspromt 的一块）+ 触发计数器，均随 memory.md 持久化。
+        self._user_impression: str = _loaded.user_impression
+        self._turn_counter: int = _loaded.turn_counter
+        self._last_impression_at: int = _loaded.last_impression_at
+        self._impression_interval: int = self._mem_cfg.impression_interval
+        self._impression_updating: bool = False
+
+        # 可被 LLM 自我编辑的长期目标 / todolist（L2a 的可变部分），独立持久化到 json。
+        self.self_state = SelfState(os.path.join("resources", "memory", "self_state.json"))
+        self.tool_registry = ToolRegistry()
+        self.tool_registry.register("update_self", self.self_state.apply_update)
+
+        # 提示词分层装配：当前时间 + 人设(L1) + 固定长远计划&目标&待办(L2a) + 长期记忆(L2b)
+        #                + 会话摘要(L3b) + 当前状态(L3a) + 自我管理工具说明。
+        self.prompt_composer = PromptComposer([
+            self._section_current_time,
+            self._section_directives,
+            self._section_user_impression,
+            self._section_long_term_memory,
+            self._section_session_summary,
+            self._section_recent_digest,
+            self._section_state,
+            self._section_tool_instructions,
+        ])
+
         self.init()
+        self._publish_memory_snapshot()  # 面板初始就有目标/待办/已注入历史可看
         logger.info("🤖 Zerolan Live Robot: Initialized services successfully.")
 
     async def start(self):
         logger.info("🤖 Zerolan Live Robot: Running...")
+        self.memory_store.start()
         async with asyncio.TaskGroup() as tg:
             tg.create_task(emitter.start())
             if self.model_manager is not None:
@@ -106,6 +173,25 @@ class ZerolanLiveRobot(BaseBot):
                     turn_thread = KillableThread(target=self._turn_dispatch_loop, daemon=True,
                                                  name="TurnDispatchLoop")
                     threads.append(turn_thread)
+
+            if self._mem_cfg.enable:
+                # 后台记忆整理（L3b 会话摘要）：把滑出工作窗口的对话增量轻压缩成会话摘要。
+                memory_thread = KillableThread(
+                    target=lambda: self.memory.run(lambda: self._timer_flag),
+                    daemon=True, name="MemoryThread")
+                threads.append(memory_thread)
+                # 温区"近期回顾"：把窗口内较早的那段对话轻压缩，缩短 prompt（工作窗口两段式）。
+                if self._mem_cfg.hot_window_size > 0:
+                    digest_thread = KillableThread(
+                        target=lambda: self.memory.run_recent_digest(lambda: self._timer_flag),
+                        daemon=True, name="RecentDigestThread")
+                    threads.append(digest_thread)
+                # 长期记忆（L2b）：累计够多后重压缩入向量库。仅当向量库可用时启动。
+                if self.vec_db is not None:
+                    archive_thread = KillableThread(
+                        target=lambda: self.memory.run_archive(lambda: self._timer_flag),
+                        daemon=True, name="MemoryArchiveThread")
+                    threads.append(archive_thread)
 
             if self.keyboard is not None:
                 keyboard_thread = KillableThread(target=self.keyboard.start, daemon=True, name="KeyboardThread")
@@ -165,6 +251,7 @@ class ZerolanLiveRobot(BaseBot):
         emitter.stop()
         kill_all_threads()
         await stop_all_runnable()
+        self.memory_store.stop()  # 把最后一次对话快照刷盘
         logger.info("Good Bye!")
 
     def init(self):
@@ -532,23 +619,220 @@ class ZerolanLiveRobot(BaseBot):
         return t_memory > 0.5
 
     def _history_for_query(self):
-        """构造发给 LLM 的历史：在干净历史基础上，瞬态拼入大脑的"内部状态"system 片段。
+        """构造发给 LLM 的历史：用分层装配器在干净历史上重写 system 消息（人设+长远计划+记忆+状态）。
 
-        返回的是一份拷贝；持久化历史（current_history）不受影响，所以状态描述不会堆进历史。
+        工作窗口两段式：只把最近 hot_window_size 条逐字发给 LLM（带时间戳），更早的在窗口内的轮次
+        改由"近期回顾(温区轻摘要)"层表示，以缩短 prompt、抑制幻觉。完整窗口仍留在 current_history
+        与磁盘上，本处只影响"发出去"的内容。返回拷贝，持久化历史不受影响。
         """
-        history = self.llm_prompt_manager.current_history
+        hist = self.llm_prompt_manager.current_history
+        hot = self._mem_cfg.hot_window_size
+        if self._mem_cfg.enable and hot > 0:
+            base = len(self.llm_prompt_manager.injected_history)
+            prefix, live = hist[:base], hist[base:]
+            if len(live) > hot:
+                hist = prefix + live[-hot:]
+        return self.prompt_composer.build_query_history(hist)
+
+    def _section_recent_digest(self) -> str:
+        """温区：窗口内较早轮次的"近期回顾"（轻压缩，去时间戳/冗余）。由后台线程维护。"""
+        if not self._mem_cfg.enable:
+            return ""
+        text = (self.memory.get_recent_digest() or "").strip()
+        if not text:
+            return ""
+        return "# 最近聊天回顾\n" + text
+
+    def _section_directives(self) -> str:
+        """L2a：固定长远计划（config 自由文本，不可变）+ 可自我编辑的长期目标/todolist（self_state）。"""
+        blocks = []
+        fixed = (_config.character.chat.long_term_directives or "").strip()
+        if fixed:
+            blocks.append("# 固定设定与长远计划\n" + fixed)
+        rendered = self.self_state.render()
+        if rendered:
+            blocks.append(rendered)
+        return "\n\n".join(blocks)
+
+    def _section_tool_instructions(self) -> str:
+        """告知 LLM 如何用 <self_update> 工具自我编辑长期目标 / todolist。"""
+        if not self._mem_cfg.enable_self_edit:
+            return ""
+        return (
+            "# 自我管理工具\n"
+            "你可以维护自己的长期目标和待办清单。当确实需要新增/完成/删除目标或待办时，"
+            "在你这次回复的【最后】单独追加一行：\n"
+            '<self_update>{"add_goal": "...", "add_todo": "...", "done_todo": "...", '
+            '"remove_goal": "...", "remove_todo": "..."}</self_update>\n'
+            "各字段都可选、可只给需要的，值可以是字符串或字符串数组。没有变更时就不要输出这一行。"
+            "这一行不会被读出来，也不要在朗读内容里提及它或它的格式。"
+        )
+
+    def _section_long_term_memory(self) -> str:
+        """L2b 长期记忆：按当前输入从向量库检索 top-k 的耐久记忆，拼进 prompt。失败静默降级为空。"""
+        if not self._mem_cfg.enable or self.vec_db is None:
+            return ""
+        q = (self._current_user_text or "").strip()
+        if not q:
+            return ""
+        try:
+            query = MilvusQuery(collection_name=self._mem_cfg.collection_name,
+                                limit=self._mem_cfg.retrieve_top_k,
+                                output_fields=['text'],
+                                query=q)
+            result = self.vec_db.search(query)
+            texts = []
+            hits_dbg = []  # 供监控：命中文本 + 距离分数（越小越相似）
+            for hits in (result.result or []):
+                for hit in hits:
+                    t = None
+                    entity = getattr(hit, "entity", None)
+                    if isinstance(entity, dict):
+                        t = entity.get("text")
+                    elif entity is not None:
+                        t = getattr(entity, "text", None)
+                    if t and str(t).strip():
+                        texts.append(str(t))
+                        hits_dbg.append({"text": str(t), "distance": getattr(hit, "distance", None)})
+            self._long_term_query = q
+            self._long_term_hits = hits_dbg
+            if not texts:
+                self._long_term_memory = ""
+                return ""
+            self._long_term_memory = "\n".join(texts)  # 供 WebUI 展示上一次检索结果
+            return "# 关于对方你记得的事\n" + "\n".join(f"- {t}" for t in texts)
+        except Exception as e:
+            logger.debug(f"Long-term memory retrieval skipped: {e}")
+            return ""
+
+    def _vec_db_count(self) -> int:
+        """向量库当前记录条数（监控用）。后端无 count 能力或出错时返回 -1。"""
+        if self.vec_db is None:
+            return -1
+        try:
+            counter = getattr(self.vec_db, "count", None)
+            if callable(counter):
+                return counter(self._mem_cfg.collection_name)
+        except Exception as e:
+            logger.debug(f"vec_db count skipped: {e}")
+        return -1
+
+    def _archive_to_vecdb(self, summary_text: str) -> None:
+        """把重压缩后的长期记忆写入向量库（MemoryManager 重压缩线程回调）。带 None 与异常保护。"""
+        if self.vec_db is None or not (summary_text or "").strip():
+            return
+        try:
+            row = InsertRow(id=int(time.time() * 1000), text=summary_text, subject="history")
+            insert = MilvusInsert(collection_name=self._mem_cfg.collection_name, texts=[row])
+            self.vec_db.insert(insert)
+            logger.info(f"Long-term memory inserted into '{self._mem_cfg.collection_name}'.")
+        except Exception as e:
+            logger.warning(f"Failed to insert long-term memory: {e}")
+
+    def _section_session_summary(self) -> str:
+        """L3b 会话摘要：被滑出工作窗口的对话经轻压缩后的浓缩（MemoryManager 维护）。"""
+        text = (self.memory.get_session_summary() or "").strip()
+        if not text:
+            return ""
+        return "# 之前聊过的内容回顾\n" + text
+
+    def _section_user_impression(self) -> str:
+        """对用户的印象：由后台线程每隔若干轮用 LLM 凝练，作为顶层人设的一块拼进 prompt。"""
+        text = (self._user_impression or "").strip()
+        if not text:
+            return ""
+        return "# 你对哥哥的印象\n" + text
+
+    def _persist_memory(self) -> None:
+        """把工作窗口对话 + 会话摘要 + 对用户的印象 + 计数器交给 MemoryStore 异步落盘。"""
+        try:
+            self.memory_store.request_save(MemoryState(
+                turns=self.llm_prompt_manager.live_turns(),
+                session_summary=self.memory.get_session_summary(),
+                recent_digest=self.memory.get_recent_digest(),
+                user_impression=self._user_impression,
+                turn_counter=self._turn_counter,
+                last_impression_at=self._last_impression_at,
+            ))
+        except Exception as e:
+            logger.debug(f"Persist memory skipped: {e}")
+
+    def _on_turn_committed(self, num_new: int) -> None:
+        """每次提交对话后累加计数器；满 impression_interval 条就后台触发"对用户的印象"更新。"""
+        self._turn_counter += max(0, int(num_new))
+        if (self._mem_cfg.enable and self._impression_interval > 0
+                and not self._impression_updating
+                and self._turn_counter - self._last_impression_at >= self._impression_interval):
+            self._last_impression_at = self._turn_counter  # 立即推进，避免后台运行期间重复触发
+            self._spawn_impression_update()
+
+    def _spawn_impression_update(self) -> None:
+        """后台线程：用最近若干轮对话 + 会话摘要 + 长期记忆，请 LLM 更新对用户的印象并落盘。"""
+        self._impression_updating = True
+        recent = list(self.llm_prompt_manager.live_turns())[-self._impression_interval:]
+        summary = self.memory.get_session_summary()
+        long_term = self._long_term_memory
+        prior = self._user_impression
+
+        def work():
+            try:
+                new_imp = update_user_impression(prior, recent, summary, long_term)
+                if new_imp and new_imp.strip():
+                    self._user_impression = new_imp.strip()
+                    logger.info(f"User impression updated ({len(self._user_impression)} chars).")
+                    self._persist_memory()
+                    self._publish_memory_snapshot()
+            except Exception as e:
+                logger.warning(f"Update user impression failed: {e}")
+            finally:
+                self._impression_updating = False
+
+        KillableThread(target=work, daemon=True, name="ImpressionUpdater").start()
+
+    def _publish_memory_snapshot(self) -> None:
+        """把当前记忆状态发布给 Brain WebUI（/brain/memory）。仅在面板开启时执行；全程吞异常。"""
+        if not (_config.system.brain.enable and _config.system.brain.enable_dashboard):
+            return
+        try:
+            from framework.memory import monitor as memory_monitor
+            history = self.llm_prompt_manager.current_history
+            turns = []
+            for c in history[-14:]:
+                role = getattr(c.role, "value", None) or str(c.role)
+                turns.append({"role": role, "content": c.content, "ts": c.metadata})
+            memory_monitor.publish({
+                "session_summary": self.memory.get_session_summary(),
+                "recent_digest": self.memory.get_recent_digest(),
+                "user_impression": self._user_impression,
+                "long_term": self._long_term_memory,
+                "vec_count": self._vec_db_count(),
+                "vec_query": self._long_term_query,
+                "vec_hits": self._long_term_hits,
+                "goals": list(self.self_state.goals),
+                "todolist": list(self.self_state.todolist),
+                "working_window": turns,
+                "history_len": len(history),
+                "turn_counter": self._turn_counter,
+            })
+        except Exception as e:
+            logger.debug(f"Publish memory snapshot skipped: {e}")
+
+    def _section_current_time(self) -> str:
+        """当前时间：让 AI 感知"现在几点"。每次构建查询时刷新。"""
+        if not self._mem_cfg.inject_timestamp:
+            return ""
+        return "# 当前时间\n" + time.strftime("%Y-%m-%d %A %H:%M:%S", time.localtime())
+
+    @staticmethod
+    def _now_ts() -> str:
+        """轮次时间戳（紧凑本地时间），写进 Conversation.metadata。"""
+        return time.strftime("%m-%d %H:%M", time.localtime())
+
+    def _section_state(self) -> str:
+        """L3a 当前状态：大脑的瞬态"内部感受"（心情/模式）。"""
         if self.brain is None or not _config.system.brain.inject_state_to_prompt:
-            return history
-        suffix = self.brain.state_prompt()
-        if not suffix:
-            return history
-        new = [Conversation(role=c.role, content=c.content) for c in history]
-        if new and new[0].role == RoleEnum.system:
-            new[0] = Conversation(role=RoleEnum.system,
-                                  content=new[0].content + "\n\n" + suffix)
-        else:
-            new.insert(0, Conversation(role=RoleEnum.system, content=suffix))
-        return new
+            return ""
+        return self.brain.state_prompt() or ""
 
     def _build_brain(self) -> None:
         """构建大脑：装配感知层（现有硬件传感器）、多内驱系统与决策循环。"""
@@ -621,6 +905,19 @@ class ZerolanLiveRobot(BaseBot):
             logger.exception(e)
         finally:
             self.conv_state.end_thinking()
+
+    def _flush_pending_proactive(self, new_history: list) -> int:
+        """若有"未被应答的主动发言"，在用户回复入历史前先把它补进去。返回补入的条数（0/1）。
+
+        只保留最近一条 pending：若用户始终不回复，新的主动发言会覆盖旧的，旧的被丢弃，
+        从而避免短期历史被无人应答的自言自语填满。
+        """
+        pending = self._pending_proactive
+        self._pending_proactive = None
+        if pending is None:
+            return 0
+        new_history.append(pending)
+        return 1
 
     def _try_switch_mode_by_voice(self, text: str) -> bool:
         """语音模式命令拦截。命中则切换模式并返回 True（该句不再送 LLM）。"""
@@ -734,7 +1031,9 @@ class ZerolanLiveRobot(BaseBot):
         if (not direct_return) and self.enable_split_by_punc and self.enable_streaming_llm:
             return self._emit_llm_prediction_streaming(text)
 
-        query = LLMQuery(text=text, history=self.llm_prompt_manager.current_history)
+        # Go through the layered composer (persona + memory + time + state) on a transient copy.
+        self._current_user_text = text
+        query = LLMQuery(text=text, history=self._history_for_query())
         prediction = self.llm.predict(query)
 
         # Filter applied here
@@ -744,23 +1043,115 @@ class ZerolanLiveRobot(BaseBot):
             logger.warning(f"LLM (Filtered): {prediction.response}")
             return None
 
+        # Parse & apply any <self_update> tool calls; use the cleaned text for speaking/persistence.
+        prediction.response = self._apply_self_updates(prediction.response)
+
         # Remove \n start
-        if prediction.response[0] == '\n':
+        if prediction.response and prediction.response[0] == '\n':
             prediction.response = prediction.response[1:]
+
+        # 模型偶尔无视提示在开头加时间戳，剥掉再朗读/持久化。
+        prediction.response = self._strip_leading_ts(prediction.response)
 
         logger.info(f"Length of current history: {len(self.llm_prompt_manager.current_history)}")
 
+        # Persist cleanly from the canonical current_history (NOT prediction.history, which is the
+        # transient composed copy with injected sections/timestamps), so layered content never
+        # leaks into the persistent history.
+        ts = self._now_ts() if self._mem_cfg.inject_timestamp else None
+        new_history = list(self.llm_prompt_manager.current_history)
+        extra = self._flush_pending_proactive(new_history)  # 把上次未应答的主动发言补到用户回复之前
+        new_history.append(Conversation(role=RoleEnum.user, content=text, metadata=ts))
+        new_history.append(Conversation(role=RoleEnum.assistant, content=prediction.response, metadata=ts))
+
+        committed = False
         if self.enable_exp_memory:
             if self.exp_memory(text, is_filtered, prediction.response, len(prediction.response)):
-                self.llm_prompt_manager.reset_history(prediction.history)
+                self.llm_prompt_manager.reset_history(new_history)
+                committed = True
         else:
             # If experiment memory disabled, history should be updated for each chat commit.
-            self.llm_prompt_manager.reset_history(prediction.history)
+            self.llm_prompt_manager.reset_history(new_history)
+            committed = True
+
+        if committed:
+            self._on_turn_committed(2 + extra)  # (主动发言?) + user + assistant
+        self._publish_memory_snapshot()
+        self._persist_memory()
 
         if not direct_return:
             emitter.emit(PipelineOutputLLMEvent(prediction=prediction))
             logger.debug("LLMEvent emitted.")
         return prediction
+
+    @staticmethod
+    def _speakable_split(buf: str) -> tuple[str, str, bool]:
+        """把流式缓冲拆成（可朗读, 暂留, 是否进入工具区）。
+
+        - 若出现完整的 <self_update> 开标记：可朗读=标记前文本，暂留=""，进入工具区=True（其后一律不读）。
+        - 否则把结尾处"可能是标记前缀"的一小段暂留，避免读出半个 "<self_up"。
+        """
+        i = buf.find(MARKER_OPEN)
+        if i != -1:
+            return buf[:i], "", True
+        maxk = min(len(buf), len(MARKER_OPEN) - 1)
+        for k in range(maxk, 0, -1):
+            if MARKER_OPEN.startswith(buf[-k:]):
+                return buf[:-k], buf[-k:], False
+        return buf, "", False
+
+    def _dispatch_clauses(self, work: str, cut_punc: str, tts_prompt) -> tuple[str, bool]:
+        """从 work 中按标点切出完整子句并派发 TTS，返回（无标点的剩余文本, 是否被过滤中止）。"""
+        while True:
+            cut_pos = -1
+            for i, ch in enumerate(work):
+                if ch in cut_punc:
+                    cut_pos = i
+                    break
+            if cut_pos < 0:
+                break
+            clause = work[:cut_pos].strip().lstrip('\n')
+            work = work[cut_pos + 1:]
+            if not clause:
+                continue
+            if self.filter.filter(clause):
+                logger.warning(f"LLM (Filtered clause, abort streaming): {clause}")
+                return work, True
+            if self.playground:
+                self.playground.add_history(role="assistant", text=clause, username=self.bot_name)
+            self._tts_without_block(tts_prompt, clause)
+        return work, False
+
+    # 模型偶尔无视提示在开头吐时间戳（如 [06-07 18:19]、(14:30)、2026-06-07 14:30、【14:30】）。
+    # prompt 约束不够可靠，这里在代码层把"开头连续的时间戳标记"强行剥掉，避免被朗读/被存进历史
+    # （存进去下一轮会再被加一层前缀，越滚越多）。
+    _LEAD_TS_RE = re.compile(
+        r'^\s*(?:'
+        r'[\[(（【]\s*\d{1,4}[\d\s\-:：月日年/]*\d\s*[\])）】]'  # 括号包裹：[06-07 18:19] (14:30) 【14:30】
+        r'|\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:\s+\d{1,2}[:：]\d{2}(?:[:：]\d{2})?)?'  # 2026-06-07 14:30:00
+        r'|\d{1,2}[-/月]\d{1,2}[日]?\s+\d{1,2}[:：]\d{2}(?:[:：]\d{2})?'  # 06-07 14:30
+        r')\s*'
+    )
+
+    @classmethod
+    def _strip_leading_ts(cls, text: str) -> str:
+        """剥掉字符串开头连续的时间戳标记（可能有多个）。无则原样返回。"""
+        if not text:
+            return text
+        prev = None
+        while prev != text:
+            prev = text
+            text = cls._LEAD_TS_RE.sub('', text, count=1)
+        return text
+
+    def _apply_self_updates(self, full_response: str) -> str:
+        """解析回复中的 <self_update> 工具块并应用，返回剥离了标记的干净文本（用于朗读/持久化）。"""
+        cleaned, updates = extract_and_strip(full_response)
+        if updates and self._mem_cfg.enable_self_edit:
+            for u in updates:
+                if self.tool_registry.dispatch("update_self", u):
+                    logger.info(f"Self-update applied: {u}")
+        return cleaned
 
     def _emit_llm_prediction_streaming(self, text: str, persist_user: bool = True) -> None:
         """
@@ -781,7 +1172,9 @@ class ZerolanLiveRobot(BaseBot):
           - `PipelineOutputLLMEvent` is NOT emitted: the streaming path drives TTS
             directly to avoid the duplicate split/dispatch logic in `llm_query_handler`.
         """
+        self._current_user_text = text
         query = LLMQuery(text=text, history=self._history_for_query())
+        logger.info(f"LLM send: {query}")
         tts_prompt = self.tts_prompt_manager.default_tts_prompt
 
         if self.cur_lang == Language.ZH:
@@ -792,7 +1185,8 @@ class ZerolanLiveRobot(BaseBot):
             cut_punc = ",.!?"
 
         full_response = ""
-        buffer = ""
+        pending = ""        # 待朗读累积区（已剥离工具标记）
+        in_tool = False     # 一旦进入 <self_update> 工具区，后续内容只累积不朗读
         first_token_logged = False
         aborted = False
 
@@ -801,29 +1195,18 @@ class ZerolanLiveRobot(BaseBot):
                 logger.debug("LLM streaming: first delta received.")
                 first_token_logged = True
             full_response += delta
-            buffer += delta
+            if in_tool:
+                # 工具标记之后的内容（JSON 体/闭合标记）只进 full_response，绝不朗读。
+                continue
+            pending += delta
+            pending = self._strip_leading_ts(pending)  # 开头若被模型加了时间戳，剥掉再朗读（锚定 ^，正文领头时为空操作）
 
-            while True:
-                cut_pos = -1
-                for i, ch in enumerate(buffer):
-                    if ch in cut_punc:
-                        cut_pos = i
-                        break
-                if cut_pos < 0:
-                    break
-
-                clause = buffer[:cut_pos].strip().lstrip('\n')
-                buffer = buffer[cut_pos + 1:]
-                if not clause:
-                    continue
-
-                if self.filter.filter(clause):
-                    logger.warning(f"LLM (Filtered clause, abort streaming): {clause}")
-                    aborted = True
-                    break
-                if self.playground:
-                    self.playground.add_history(role="assistant", text=clause, username=self.bot_name)
-                self._tts_without_block(tts_prompt, clause)
+            speakable, held, entered = self._speakable_split(pending)
+            if entered:
+                in_tool = True
+            leftover, aborted = self._dispatch_clauses(speakable, cut_punc, tts_prompt)
+            # 未切出的剩余 + 暂留的（半个）标记前缀，留到下一轮；进入工具区后 held 为空。
+            pending = leftover + held
 
             if aborted:
                 break
@@ -831,8 +1214,9 @@ class ZerolanLiveRobot(BaseBot):
         if aborted:
             return None
 
-        # Flush any trailing text without a closing punctuation mark.
-        tail = buffer.strip().lstrip('\n')
+        # Flush any trailing speakable text (strip a possible partial tool marker).
+        tail, _, _ = self._speakable_split(pending)
+        tail = tail.strip().lstrip('\n')
         if tail:
             if self.filter.filter(tail):
                 logger.warning(f"LLM (Filtered tail): {tail}")
@@ -841,22 +1225,40 @@ class ZerolanLiveRobot(BaseBot):
                 self.playground.add_history(role="assistant", text=tail, username=self.bot_name)
             self._tts_without_block(tts_prompt, tail)
 
-        full_response = full_response.lstrip('\n')
+        # Parse & apply any <self_update> tool calls, and use the cleaned text for history.
+        full_response = self._strip_leading_ts(self._apply_self_updates(full_response).lstrip('\n'))
         logger.info(f"LLM (stream): {full_response}")
         logger.info(f"Length of current history: {len(self.llm_prompt_manager.current_history)}")
 
         # Update chat history with the full response. The streaming generator does NOT
         # touch `query.history`, so we have to do it here.
-        new_history = list(self.llm_prompt_manager.current_history)
-        if persist_user:
-            new_history.append(Conversation(role=RoleEnum.user, content=text))
-        new_history.append(Conversation(role=RoleEnum.assistant, content=full_response))
+        ts = self._now_ts() if self._mem_cfg.inject_timestamp else None
 
+        # 主动开口：先不写进历史，仅暂存。等用户真的回复了，下一轮再连同用户回复一起补进去。
+        if not persist_user:
+            self._pending_proactive = Conversation(role=RoleEnum.assistant, content=full_response, metadata=ts)
+            logger.debug("Proactive utterance held pending a user reply (not yet persisted).")
+            self._publish_memory_snapshot()
+            return None
+
+        new_history = list(self.llm_prompt_manager.current_history)
+        extra = self._flush_pending_proactive(new_history)  # 把上次未应答的主动发言补到用户回复之前
+        new_history.append(Conversation(role=RoleEnum.user, content=text, metadata=ts))
+        new_history.append(Conversation(role=RoleEnum.assistant, content=full_response, metadata=ts))
+
+        committed = False
         if self.enable_exp_memory:
             if self.exp_memory(text, False, full_response, len(full_response)):
                 self.llm_prompt_manager.reset_history(new_history)
+                committed = True
         else:
             self.llm_prompt_manager.reset_history(new_history)
+            committed = True
+
+        if committed:
+            self._on_turn_committed(2 + extra)
+        self._publish_memory_snapshot()
+        self._persist_memory()
 
         return None
 

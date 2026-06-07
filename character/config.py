@@ -39,6 +39,12 @@ class ChatConfig(BaseModel):
                     "This array must be an even number, i.e. it must end the message that the `assistant` replies.")
     max_history: int = Field(20,
                              description="Maximum number of messages to keep in chat history.")
+    long_term_directives: str = Field(
+        default="",
+        description="Layer L2a of the prompt: fixed long-term directives / goals / settings that should always hold, "
+                    "written as one free-form text block (e.g. ongoing plans, standing rules, relationship facts you "
+                    "want permanently true). It is injected as a labeled section of the system prompt on every turn, "
+                    "BELOW the persona and ABOVE dynamic memory/state. Leave empty to skip this section.")
 
 
 class SpeechConfig(BaseModel):

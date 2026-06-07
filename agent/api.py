@@ -173,6 +173,61 @@ def summary_history(history: List[Conversation]) -> AIMessage:
 
 
 @log_run_time()
+def light_digest(history: List[Conversation]) -> str:
+    """温区轻压缩：把"较早一些的窗口内对话"压成简洁回顾。不过分压缩——只去口语冗余/重复，
+    把逐句时间戳折叠成时间范围，保留关键信息/决定/情绪。用于缩短 prompt、抑制幻觉。"""
+    system_template = (
+        "你是对话压缩助手。把下面这段较早的对话压成极简要点，要求：\n"
+        "1) 最多 3 条要点，总共不超过 150 字；只保留真正重要的事实/决定/情绪，其余全部丢弃；\n"
+        "2) 不要逐句时间戳，开头用一个时间范围概括（如“06-07 14:00–14:40：”）即可；\n"
+        "3) 第三人称、电报式短句，不要复述对话、不要寒暄、不要细节铺陈；\n"
+        "4) 只输出要点本身，不要解释、不要加任何新的时间戳标记、不要编造。"
+    )
+    text = ""
+    for c in history:
+        role = getattr(c.role, "value", None) or str(c.role)
+        ts = f"[{c.metadata}] " if getattr(c, "metadata", None) else ""
+        text += f"{ts}[{role}] {c.content}\n"
+    prompt_template = ChatPromptTemplate.from_messages(
+        [("system", system_template), ("user", "{text}\n\n任务：把以上对话压成简洁回顾。")]
+    )
+    result = prompt_template.invoke({"text": text})
+    result.to_messages()
+    response = _model.invoke(result)
+    return (response.content or "").strip()
+
+
+@log_run_time()
+def update_user_impression(prior_impression: str, history: List[Conversation],
+                           session_summary: str = "", long_term: str = "") -> str:
+    """基于已有印象 + 最近对话 + 记忆摘要，更新并返回对用户的整体印象画像。"""
+    system_template = (
+        "你是一个长期陪伴用户的 AI。请基于【已有印象】【会话摘要】【更早的长期记忆】"
+        "和【最近的对话】，更新你对哥哥的整体印象画像：性格、习惯、当前状态、在意的事、关系动态、"
+        "需要注意的点等。要求：用中文；保留仍然成立的旧印象，融合新信息，修正过时内容；"
+        "高度凝练，只保留最稳定、最关键的特征，总共不超过150字；可以是几条短要点或一小段话；"
+        "只输出印象本身，不要解释、不要寒暄、不要加时间戳。"
+    )
+    convo = ""
+    for c in history:
+        convo += f"[{c.role}] {c.content}\n"
+    user_template = (
+        "【已有印象】\n{prior}\n\n【会话摘要】\n{summary}\n\n【更早的长期记忆】\n{long_term}\n\n"
+        "【最近的对话】\n{convo}\n\n【你的任务】综合以上，输出更新后的“对用户的印象”。"
+    )
+    prompt_template = ChatPromptTemplate.from_messages(
+        [("system", system_template), ("user", user_template)]
+    )
+    result = prompt_template.invoke({"prior": prior_impression or "（暂无）",
+                                     "summary": session_summary or "（暂无）",
+                                     "long_term": long_term or "（暂无）",
+                                     "convo": convo or "（暂无）"})
+    result.to_messages()
+    response = _model.invoke(result)
+    return (response.content or "").strip()
+
+
+@log_run_time()
 def model_scale(info: List[GameObject], question: str) -> ScaleOperationResponse | None:
     config = get_config()
     model = LangChainAdaptedLLM(config=config.pipeline.llm)

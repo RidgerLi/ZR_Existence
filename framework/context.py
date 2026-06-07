@@ -117,7 +117,11 @@ class ZerolanLiveRobotContext:
             if _config.service.live_stream.twitch.enable:
                 self.twitch = TwitchService(_config.service.live_stream.twitch)
         if _config.pipeline.vec_db.enable:
-            self.vec_db = MilvusSyncPipeline(_config.pipeline.vec_db.milvus)
+            if _config.pipeline.vec_db.backend == "milvus":
+                self.vec_db = MilvusSyncPipeline(_config.pipeline.vec_db.milvus)
+            else:
+                from pipeline.db.milvus.chroma_local import ChromaLocalPipeline
+                self.vec_db = ChromaLocalPipeline(_config.pipeline.vec_db)
         if _config.service.playground.enable:
             self.model_manager = ModelManager()
             self.bot_id = _config.service.playground.bot_id

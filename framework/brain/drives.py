@@ -66,14 +66,14 @@ def default_mode_presets() -> Dict[str, DriveParams]:
         ),
         "normal": DriveParams(
             base_drive=0.05, fire_threshold=1.0,
-            social_rise_per_s=0.004,
+            social_rise_per_s=0.003,
             refractory_s=45.0, max_consecutive_fires=3,
         ),
         "companion": DriveParams(
-            base_drive=0.12, fire_threshold=0.85,
+            base_drive=0.08, fire_threshold=0.95,
             w_social=0.45, keyboard_suppress=0.6,
-            social_rise_per_s=0.008,
-            refractory_s=20.0, max_consecutive_fires=4,
+            social_rise_per_s=0.005,
+            refractory_s=40.0, max_consecutive_fires=3,
         ),
     }
 

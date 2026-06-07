@@ -64,6 +64,55 @@ class BrainConfig(BaseModel):
                     "NOT persisted into chat history (so history stays clean of fake user turns).")
 
 
+class MemoryConfig(BaseModel):
+    """分层记忆配置（工作窗口由 character.chat.max_history 控制；这里是其后的压缩/入库/检索旋钮）。
+
+    三层：L0 工作窗口（max_history 条逐字真实对话）→ L3b 会话摘要（轻压缩）→ L2b 长期记忆（重压缩 + 向量库）。
+    """
+    enable: bool = Field(default=True,
+                         description="Master switch for the layered memory system (session summary + long-term vector memory). "
+                                     "When False, only the sliding-window working memory (character.chat.max_history) is kept.")
+    inject_timestamp: bool = Field(default=True,
+                                   description="Stamp each real conversation turn with a local timestamp and inject a '当前时间' "
+                                               "section + per-turn time prefixes into the LLM prompt, so the AI is time-aware "
+                                               "(knows 'now' and how long ago each turn was said). Few-shot examples are not stamped.")
+    light_interval_s: float = Field(default=60.0,
+                                    description="L3b session-summary thread period (seconds). How often the background light "
+                                                "compression folds evicted turns into the running session summary.")
+    light_min_pending: int = Field(default=4,
+                                   description="Minimum number of evicted turns buffered before a light compression fires "
+                                               "(avoids calling the summarizer LLM too frequently).")
+    # --- Phase 3b: 长期记忆 / 向量库 ---
+    long_term_threshold: int = Field(default=40,
+                                     description="When the count of evicted real turns accumulated reaches this, the oldest block is "
+                                                 "heavily summarized and written into the vector DB (long-term memory).")
+    retrieve_top_k: int = Field(default=2,
+                                description="Number of long-term memory chunks retrieved from the vector DB per turn and injected into the prompt.")
+    collection_name: str = Field(default="history_collection",
+                                 description="Milvus collection name used for long-term conversation memory.")
+    heavy_interval_s: float = Field(default=120.0,
+                                    description="L2b long-term thread period (seconds) for heavy compression + vector-DB insertion.")
+    # --- Phase 3c: 自我编辑 ---
+    enable_self_edit: bool = Field(default=True,
+                                   description="Allow the LLM to edit its own long-term goals / todolist via the <self_update> "
+                                               "prompt-JSON tool. The tool markers are stripped from spoken output.")
+    # --- 对用户的印象 ---
+    impression_interval: int = Field(default=40,
+                                     description="Every this many committed conversation turns, a background thread asks the LLM to "
+                                                 "update the durable 'impression of the user' from recent turns + summaries. "
+                                                 "Set to 0 to disable.")
+    # --- 工作窗口两段式：热区逐字 + 温区轻摘要 ---
+    hot_window_size: int = Field(default=10,
+                                 description="Number of most-recent real turns kept VERBATIM (with timestamps) in the prompt. "
+                                             "Older in-window turns are replaced by a light 'recent digest' to shrink the prompt and "
+                                             "curb hallucination. The full working window (max_history) is still kept in memory/disk; "
+                                             "this only affects what is sent to the LLM. Set to 0 to disable the split (send all).")
+    recent_digest_interval_s: float = Field(default=30.0,
+                                            description="Background period (seconds) for rebuilding the light 'recent digest' of the "
+                                                        "older in-window turns (dedupe + drop per-turn timestamps into a time range, "
+                                                        "keep key info). Only re-runs the LLM when that older portion actually changed.")
+
+
 class SystemConfig(BaseModel):
     default_enable_microphone: bool = Field(default=False,
                                             description="For safety, do not open your microphone by default. \n"
@@ -109,6 +158,10 @@ class SystemConfig(BaseModel):
                                description='The decision brain that sits before the LLM: perception (mic energy / VAD / keyboard / time), '
                                            'a multi-drive bionic model (arousal / social need / expression urge), proactive speech and '
                                            'proactivity mode switching, plus a live monitoring dashboard.')
+    memory: MemoryConfig = Field(default=MemoryConfig(),
+                                 description='Layered conversation memory: sliding-window working memory, background session summary '
+                                             '(light compression), long-term vector-DB memory (heavy compression + retrieval), '
+                                             'per-turn timestamps, and LLM self-editable goals/todolist.')
 
 
 class ZerolanLiveRobotConfig(BaseModel):

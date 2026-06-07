@@ -40,7 +40,10 @@ class BaseBot(ZerolanLiveRobotContext):
 
         # Vector Database Pipeline
         if self.vec_db is not None:
-            if isinstance(self.vec_db, MilvusSyncPipeline):
+            from pipeline.db.milvus.chroma_local import ChromaLocalPipeline
+            if isinstance(self.vec_db, ChromaLocalPipeline):
+                self.vec_db = ChromaLocalPipeline(config.pipeline.vec_db)
+            elif isinstance(self.vec_db, MilvusSyncPipeline):
                 self.vec_db = MilvusSyncPipeline(config.pipeline.vec_db.milvus)
             elif isinstance(self.vec_db, MilvusAsyncPipeline):
                 self.vec_db = MilvusAsyncPipeline(config.pipeline.vec_db.milvus)

@@ -176,11 +176,16 @@ class ResourceServer(ThreadRunnable):
         import logging
 
         from framework.brain import monitor
+        from framework.memory import monitor as memory_monitor
+        from framework import log_monitor
 
         # 大脑面板每 ~300ms 轮询一次 /brain/state 与 /brain/history，werkzeug 开发服务器默认
         # 会为每个请求打一条访问日志，导致刷屏。这里把 werkzeug 访问日志降到 WARNING 级，
         # 只保留真正的告警/错误（不影响本项目自身的 loguru 日志）。
         logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+        # 把本进程日志收进环形缓冲，供面板 /brain/logs 展示。
+        log_monitor.install_sink()
 
         @self.app.route("/brain/state")
         def brain_state():
@@ -189,6 +194,14 @@ class ResourceServer(ThreadRunnable):
         @self.app.route("/brain/history")
         def brain_history():
             return jsonify(monitor.get_history())
+
+        @self.app.route("/brain/memory")
+        def brain_memory():
+            return jsonify(memory_monitor.get_latest() or {})
+
+        @self.app.route("/brain/logs")
+        def brain_logs():
+            return jsonify(log_monitor.get_logs())
 
         @self.app.route("/brain")
         def brain_dashboard():
@@ -227,6 +240,24 @@ _BRAIN_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .legend { display:flex; gap:14px; font-size:11px; margin-top:6px; }
   .legend span::before { content:"\\2014  "; }
   .full { grid-column: 1 / -1; }
+  h3.sub { font-size:11px; color:#8b949e; margin:12px 0 4px; text-transform:uppercase; letter-spacing:1px; }
+  .kv { font-size:12px; }
+  .kv .k { color:#8b949e; }
+  .mem-sum { white-space:pre-wrap; background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:8px; font-size:12px; max-height:140px; overflow:auto; }
+  ul.goals { padding-left:18px; margin:6px 0; font-size:12px; }
+  ul.todo { list-style:none; padding-left:0; margin:6px 0; font-size:12px; }
+  ul.todo li.done { color:#6e7681; text-decoration:line-through; }
+  ul.goals li.k, ul.todo li.k { color:#6e7681; list-style:none; }
+  .turns { font-size:12px; max-height:220px; overflow:auto; }
+  .turns .turn { margin:4px 0; line-height:1.45; }
+  .turns .role-user b { color:#79c0ff; }
+  .turns .role-assistant b { color:#7ee787; }
+  .turns .role-system b { color:#8b949e; }
+  .turns .ts { color:#6e7681; margin-right:6px; }
+  .logs { font-family: ui-monospace, Consolas, monospace; font-size:11.5px; max-height:300px; overflow:auto; background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:8px; }
+  .logs .row { white-space:pre-wrap; line-height:1.4; }
+  .logs .t { color:#6e7681; }
+  .lv-INFO{color:#79c0ff}.lv-DEBUG{color:#8b949e}.lv-WARNING{color:#ffa657}.lv-ERROR{color:#f85149}.lv-SUCCESS{color:#7ee787}.lv-CRITICAL{color:#f85149}
 </style>
 </head>
 <body>
@@ -251,6 +282,21 @@ _BRAIN_DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span style="color:#79c0ff">social_need</span>
       <span style="color:#f85149">threshold</span>
     </div>
+  </div>
+  <div class="card full"><h2>Memory 记忆 / 历史</h2>
+    <div class="kv"><span class="k">working window</span> <b id="histlen">-</b> turns　<span class="k">turn counter</span> <b id="turncnt">-</b></div>
+    <h3 class="sub">对用户的印象</h3><div class="mem-sum" id="impression">-</div>
+    <h3 class="sub">长期目标</h3><ul class="goals" id="goals"></ul>
+    <h3 class="sub">待办清单</h3><ul class="todo" id="todos"></ul>
+    <h3 class="sub">最近聊天回顾 (温区)</h3><div class="mem-sum" id="digest">-</div>
+    <h3 class="sub">会话摘要 (L3b)</h3><div class="mem-sum" id="summary">-</div>
+    <h3 class="sub">向量库 / 检索 (L2b)　<span class="k">库条数</span> <b id="veccount">-</b></h3>
+    <div class="kv"><span class="k">query</span> <span id="vecquery">-</span></div>
+    <div class="turns" id="vechits"></div>
+    <h3 class="sub">工作窗口最近对话</h3><div class="turns" id="turns"></div>
+  </div>
+  <div class="card full"><h2>Logs 日志</h2>
+    <div class="logs" id="logs"></div>
   </div>
 </main>
 <script>
@@ -303,7 +349,43 @@ async function drawChart(threshold){
       i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.stroke();
   });
 }
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+async function tickMemory(){
+  try{
+    const m = await (await fetch('/brain/memory')).json();
+    if(!m) return;
+    document.getElementById('histlen').textContent = (m.history_len!=null)?m.history_len:'-';
+    document.getElementById('turncnt').textContent = (m.turn_counter!=null)?m.turn_counter:'-';
+    document.getElementById('impression').textContent = m.user_impression || '（暂无）';
+    document.getElementById('goals').innerHTML = (m.goals&&m.goals.length)
+      ? m.goals.map(g=>`<li>${esc(g)}</li>`).join('') : '<li class="k">（空）</li>';
+    document.getElementById('todos').innerHTML = (m.todolist&&m.todolist.length)
+      ? m.todolist.map(t=>`<li class="${t.done?'done':''}">${t.done?'☑':'☐'} ${esc(t.text)}</li>`).join('')
+      : '<li class="k">（空）</li>';
+    document.getElementById('digest').textContent = m.recent_digest || '（暂无）';
+    document.getElementById('summary').textContent = m.session_summary || '（暂无）';
+    document.getElementById('veccount').textContent = (m.vec_count!=null && m.vec_count>=0)?m.vec_count:'-';
+    document.getElementById('vecquery').textContent = m.vec_query || '（暂无）';
+    document.getElementById('vechits').innerHTML = (m.vec_hits&&m.vec_hits.length)
+      ? m.vec_hits.map(h=>`<div class="turn"><span class="ts">dist ${h.distance!=null?Number(h.distance).toFixed(3):'?'}</span> ${esc(h.text)}</div>`).join('')
+      : '<div class="k">（本轮无命中）</div>';
+    document.getElementById('turns').innerHTML = (m.working_window||[]).map(t=>
+      `<div class="turn role-${esc(t.role)}"><span class="ts">${t.ts?esc(t.ts):''}</span><b>${esc(t.role)}</b>: ${esc(t.content)}</div>`).join('');
+  }catch(e){}
+}
+async function tickLogs(){
+  try{
+    const rows = await (await fetch('/brain/logs')).json();
+    const box = document.getElementById('logs');
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    box.innerHTML = rows.map(r=>
+      `<div class="row"><span class="t">${esc(r.time)}</span> <span class="lv-${esc(r.level)}">${esc(r.level)}</span> ${esc(r.message)}</div>`).join('');
+    if(atBottom) box.scrollTop = box.scrollHeight;
+  }catch(e){}
+}
 setInterval(tick, 300); tick();
+setInterval(tickMemory, 1500); tickMemory();
+setInterval(tickLogs, 1500); tickLogs();
 </script>
 </body>
 </html>"""

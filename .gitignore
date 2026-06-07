@@ -10,3 +10,4 @@ resources/config.yaml
 config.yaml
 /services/playground/proto/*_pb2*.py
 /napcat/
+./launch_all.bat
