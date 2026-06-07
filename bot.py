@@ -626,13 +626,16 @@ class ZerolanLiveRobot(BaseBot):
         与磁盘上，本处只影响"发出去"的内容。返回拷贝，持久化历史不受影响。
         """
         hist = self.llm_prompt_manager.current_history
+        base = len(self.llm_prompt_manager.injected_history)
+        prefix, live = list(hist[:base]), list(hist[base:])
         hot = self._mem_cfg.hot_window_size
-        if self._mem_cfg.enable and hot > 0:
-            base = len(self.llm_prompt_manager.injected_history)
-            prefix, live = hist[:base], hist[base:]
-            if len(live) > hot:
-                hist = prefix + live[-hot:]
-        return self.prompt_composer.build_query_history(hist)
+        if self._mem_cfg.enable and hot > 0 and len(live) > hot:
+            live = live[-hot:]
+        # 把"已说出口但还没被应答"的主动发言作为上下文带上，让 AI 应答时知道自己刚说了什么。
+        # 它此时还没进 current_history（要等用户真的回复才落历史），所以只在这份发出去的拷贝里补上。
+        if self._pending_proactive is not None:
+            live = live + [self._pending_proactive]
+        return self.prompt_composer.build_query_history(prefix + live)
 
     def _section_recent_digest(self) -> str:
         """温区：窗口内较早轮次的"近期回顾"（轻压缩，去时间戳/冗余）。由后台线程维护。"""
