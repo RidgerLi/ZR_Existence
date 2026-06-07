@@ -5,10 +5,12 @@ Author: ZerolanLiveRobot
 承接 `LLMPromptManager` 滑动窗口裁掉的"真实对话"，做后台压缩与长期入库：
 
     L3b 会话摘要（轻压缩）：被滑出工作窗口的对话，由后台轻线程用 `summary_history` 增量
-        折叠进一段 `session_summary`，回拼进 prompt（每轮可见的"之前聊过的内容"）。
+        折叠进一段 `session_summary`（关键节点/结论/承诺要点），回拼进 prompt（"之前聊过的内容"）。
 
-    L2b 长期记忆（重压缩 + 向量库，Phase 3b）：真实对话累计很多后，最旧的大块经 `summary_history`
-        重压缩写入向量库（Milvus history_collection）；prompt 构建时按当前输入检索 top-k 回拼。
+    L2b 长期记忆（事实抽取 + 向量库，Phase 3b）：真实对话累计很多后，最旧的大块经
+        `extract_durable_facts` 只抽"以后仍成立的耐久事实"写入向量库（Milvus history_collection）；
+        prompt 构建时按当前输入检索 top-k 回拼。刻意与会话摘要分离：摘要记"发生了什么"，
+        长期记忆记"以后还用得上的事实"，避免把一次性情节/瞬时状态当事实检索回来。
 
 线程安全：
     - 被裁内容通过 `enqueue_evicted` 进入待压缩缓冲（加锁）。
@@ -23,7 +25,7 @@ from typing import Callable, List
 from loguru import logger
 from zerolan.data.pipeline.llm import Conversation, RoleEnum
 
-from agent.api import summary_history, light_digest
+from agent.api import summary_history, light_digest, extract_durable_facts
 
 
 class MemoryManager:
@@ -36,6 +38,7 @@ class MemoryManager:
                  recent_digest_interval_s: float = 30.0,
                  summarizer: Callable[[List[Conversation]], str] | None = None,
                  digester: Callable[[List[Conversation]], str] | None = None,
+                 archiver: Callable[[List[Conversation]], str] | None = None,
                  live_turns_provider: Callable[[], List[Conversation]] | None = None,
                  archive_sink: Callable[[str], None] | None = None):
         """
@@ -45,8 +48,10 @@ class MemoryManager:
         :param long_term_threshold: 长期缓冲累计到多少条真实对话才触发一次重压缩 + 入库。
         :param hot_window_size: 工作窗口中"逐字保留"的最近轮次数；其余在窗口内的较早轮次由温区摘要表示。
         :param recent_digest_interval_s: 温区"近期回顾"重建的检查周期（秒）。
-        :param summarizer: 摘要函数（重一点），默认用 agent.api.summary_history。
+        :param summarizer: 会话摘要函数（关键节点要点），默认用 agent.api.summary_history。
         :param digester: 温区轻压缩函数，默认用 agent.api.light_digest。
+        :param archiver: 长期记忆抽取函数（只抽耐久事实），默认用 agent.api.extract_durable_facts。
+                         与 summarizer 分离：会话摘要记"本次发生了什么"，长期记忆只记"以后仍成立的事实"。
         :param live_turns_provider: 返回当前工作窗口真实对话（用于切出温区那段）。
         :param archive_sink: 把重压缩后的长期记忆文本落库的回调（由 bot 提供，写入向量库）。
         """
@@ -58,6 +63,7 @@ class MemoryManager:
         self._recent_digest_interval_s = recent_digest_interval_s
         self._summarizer = summarizer or self._default_summarize
         self._digester = digester or self._default_digest
+        self._archiver = archiver or self._default_archive
         self._live_turns_provider = live_turns_provider
         self.archive_sink = archive_sink
 
@@ -81,6 +87,10 @@ class MemoryManager:
     @staticmethod
     def _default_digest(items: List[Conversation]) -> str:
         return light_digest(items)
+
+    @staticmethod
+    def _default_archive(items: List[Conversation]) -> str:
+        return extract_durable_facts(items)
 
     def enqueue_evicted(self, turns: List[Conversation]) -> None:
         """接收被滑出工作窗口的真实对话。同时进入轻压缩缓冲（→会话摘要）与长期缓冲（→重压缩入库）。
@@ -179,7 +189,8 @@ class MemoryManager:
             block = self._lt_buffer[:self._long_term_threshold]
             self._lt_buffer = self._lt_buffer[self._long_term_threshold:]
 
-        digest = (self._summarizer(block) or "").strip()
+        # 长期记忆只抽"耐久事实"，与会话摘要（关键节点流水）分离，避免把过期情节当事实入库。
+        digest = (self._archiver(block) or "").strip()
         if not digest:
             return
         try:

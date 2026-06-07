@@ -19,10 +19,15 @@ Author: ZerolanLiveRobot
 L2b / L3b 现在留空 provider（返回 ""），Phase 3 接上记忆库时只需替换 provider，无需改本类。
 """
 
+import re
 from typing import Callable, List
 
 from loguru import logger
 from zerolan.data.pipeline.llm import Conversation, RoleEnum
+
+# 历史里曾用过两种逐轮时间戳：`06-07 22:44` 与 `06-07 周日 23:13`。渲染发送时统一抹掉
+# “周X / 星期X”这类星期词，让模型看到的时间前缀格式一致（[MM-DD HH:MM]）。
+_WEEKDAY_RE = re.compile(r"\s*(?:周|星期|礼拜)[一二三四五六日天]\s*")
 
 
 class PromptComposer:
@@ -49,18 +54,29 @@ class PromptComposer:
                 blocks.append(text)
         return "\n\n".join(blocks)
 
+    @staticmethod
+    def _normalize_ts(metadata: str) -> str:
+        """把逐轮时间戳归一化为统一格式（抹掉“周X/星期X”等星期词，合并多余空格）。"""
+        ts = _WEEKDAY_RE.sub(" ", str(metadata))
+        return re.sub(r"\s+", " ", ts).strip()
+
     def build_query_history(self, current_history: List[Conversation]) -> List[Conversation]:
         """返回一份历史拷贝，其中 system 消息被替换为分层拼装后的内容。
 
         few-shot 示例与真实对话原样保留；持久化历史（传入的 current_history）不受影响。
         若某真实轮次带有时间戳（metadata），在其 content 前加紧凑时间前缀（如 `[06-07 14:30] …`），
         让 LLM 感知每句话是何时说的；few-shot 示例无 metadata，不受影响。
+
+        另外做两步归一化，只作用于"发出去"的拷贝：
+          1) 时间戳格式统一（见 _normalize_ts）；
+          2) 合并相邻同角色轮次（system 除外）。主动开口被插入历史时会产生连续两条 assistant，
+             部分严格要求 user/assistant 交替的服务端会报错或降质，这里在发送前折叠掉。
         """
         new: List[Conversation] = []
         for c in current_history:
             content = c.content
             if c.role != RoleEnum.system and c.metadata:
-                content = f"[{c.metadata}] {content}"
+                content = f"[{self._normalize_ts(c.metadata)}] {content}"
             new.append(Conversation(role=c.role, content=content))
 
         if new and new[0].role == RoleEnum.system:
@@ -70,4 +86,20 @@ class PromptComposer:
             composed = self.compose_system("")
             if composed:
                 new.insert(0, Conversation(role=RoleEnum.system, content=composed))
-        return new
+
+        return self._merge_consecutive_roles(new)
+
+    @staticmethod
+    def _merge_consecutive_roles(history: List[Conversation]) -> List[Conversation]:
+        """把相邻同角色的消息合并成一条（content 用换行拼接），保证 user/assistant 严格交替。
+        system 不参与合并（它只会出现在开头）。"""
+        merged: List[Conversation] = []
+        for c in history:
+            if (merged and c.role != RoleEnum.system
+                    and merged[-1].role == c.role):
+                prev = merged[-1]
+                joined = f"{prev.content}\n{c.content}" if prev.content else c.content
+                merged[-1] = Conversation(role=prev.role, content=joined)
+            else:
+                merged.append(c)
+        return merged

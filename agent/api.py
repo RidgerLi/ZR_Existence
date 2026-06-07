@@ -158,18 +158,61 @@ def summary(text: str, max_len: int = 100) -> AIMessage:
 
 @log_run_time()
 def summary_history(history: List[Conversation]) -> AIMessage:
-    system_template = "将这段用户与你的对话总结成一段话，需要包含重要细节。"
+    """会话摘要（L3b）：把一段被滑出窗口的对话压成"关键节点/结论/承诺"的要点列表。
+
+    刻意去台词化、去文采：只记发生了什么、定下了什么、答应了什么，绝不复述对话过程或
+    模仿角色口吻。这样既省 token，又避免把旧情节当成"刚发生的事"诱导模型复述。
+    """
+    system_template = (
+        "你是对话归档助手。把下面这段用户对话压成关键节点要点，要求：\n"
+        "1) 用要点列表（每行以“- ”开头），最多 5 条，总共不超过 120 字；\n"
+        "2) 只记真正重要的事实/决定/承诺/状态变化（如“日历缺货→改买本子”“答应明早在本子第一页写字”），"
+        "其余寒暄、过程、动作描写、玩笑全部丢弃；\n"
+        "3) 第三人称、电报式短句，绝对不要复述对话原文、不要模仿角色口吻、不要加动作括号；\n"
+        "4) 不要写任何时间戳/日期；只输出要点本身，不要解释、不要编造。"
+    )
     text = ""
     for conversation in history:
-        text += f"[{conversation.role}]\n{conversation.content}"
+        text += f"[{conversation.role}]\n{conversation.content}\n"
     prompt_template = ChatPromptTemplate.from_messages(
-        [("system", system_template), ("user", "{text}")]
+        [("system", system_template), ("user", "{text}\n\n任务：把以上对话压成关键节点要点。")]
     )
     result = prompt_template.invoke({"text": text})
     result.to_messages()
     response = _model.invoke(result)
 
     return response
+
+
+@log_run_time()
+def extract_durable_facts(history: List[Conversation]) -> str:
+    """长期记忆（L2b）：从一段对话里只抽取"跨会话仍然成立的耐久事实"，写入向量库。
+
+    与 `summary_history` 的区别：长期记忆不是流水账，而是关于哥哥的、未来还用得上的事实——
+    偏好、习惯、关系、长期目标、立下的承诺。刻意剔除一次性情节与瞬时状态（如“现在在洗澡”
+    “趁热吃出门”），避免检索时把过期状态当成当下事实塞回 prompt 造成时间线矛盾。
+    """
+    system_template = (
+        "你是长期记忆抽取助手。从下面这段对话里，只抽取“以后仍然成立、值得长期记住”的关于用户的事实，"
+        "写成要点。要求：\n"
+        "1) 用要点列表（每行以“- ”开头），最多 5 条，总共不超过 120 字；\n"
+        "2) 只保留耐久信息：偏好/口味、习惯、关系与称呼、长期目标、明确许下的承诺、值得记住的设定；\n"
+        "3) 必须丢弃一次性情节、当下动作、瞬时状态（如“正在洗澡”“现在要出门”“刚吃了西瓜”），"
+        "这些是临时状态，不属于长期记忆；\n"
+        "4) 第三人称、客观陈述句，不要复述对话、不要角色口吻、不要动作括号、不要时间戳；\n"
+        "5) 若这段对话没有任何值得长期记住的事实，只输出空字符串。只输出要点本身。"
+    )
+    text = ""
+    for c in history:
+        role = getattr(c.role, "value", None) or str(c.role)
+        text += f"[{role}] {c.content}\n"
+    prompt_template = ChatPromptTemplate.from_messages(
+        [("system", system_template), ("user", "{text}\n\n任务：抽取关于哥哥的耐久事实要点。")]
+    )
+    result = prompt_template.invoke({"text": text})
+    result.to_messages()
+    response = _model.invoke(result)
+    return (response.content or "").strip()
 
 
 @log_run_time()
@@ -205,12 +248,16 @@ def update_user_impression(prior_impression: str, history: List[Conversation],
 
     会把【人设/system_prompt】一并喂入，并要求 LLM **不要重复人设里已经写过的内容**，
     只记录从真实相处中"学到的、人设里没有的"新信息，避免印象与人设冗余。
+
+    职责切分：本函数只画"性格/行为模式"画像（形容词性的概括，如“有方向就肯行动、容易拖延”），
+    具体的事件性事实、偏好、承诺归长期记忆（向量库）负责，这里不要重复记那些。
     """
     system_template = (
-        "你是一个长期陪伴用户（哥哥）的 AI。请更新你对哥哥的印象画像。\n"
-        "【最重要】下面会给你一份【已知人设】——里面已经写过的设定、性格、背景，绝对不要再写进印象里。"
-        "印象只记录你从真实相处中**新观察到、人设里没有的**信息：他最近的状态、具体习惯、在意的事、"
-        "关系里的小细节、需要注意的点等。\n"
+        "你是一个长期陪伴用户（哥哥）的 AI。请更新你对哥哥的【性格与行为模式】画像。\n"
+        "【最重要】下面会给你一份【已知人设】——里面已经写过的设定、性格、背景，绝对不要再写进印象里。\n"
+        "印象只写你从真实相处中**新观察到的、概括性的行为模式与脾性**（形容词性的描述，如"
+        "“出门后执行力比在家高”“规划时犹豫但有方向就肯走”），帮助你更懂怎么跟他相处。\n"
+        "不要写具体的一次性事件、偏好清单或承诺（那些由长期记忆单独负责），也不要复述对话流水。\n"
         "要求：用中文；保留仍成立的旧印象、融合新信息、删掉过时或与人设重复的内容；"
         "极度凝练，最多 3 条短要点、总共不超过 100 字；只输出印象本身，不要解释、不要寒暄、不要加时间戳。"
     )
