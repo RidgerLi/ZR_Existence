@@ -199,26 +199,35 @@ def light_digest(history: List[Conversation]) -> str:
 
 @log_run_time()
 def update_user_impression(prior_impression: str, history: List[Conversation],
-                           session_summary: str = "", long_term: str = "") -> str:
-    """基于已有印象 + 最近对话 + 记忆摘要，更新并返回对用户的整体印象画像。"""
+                           session_summary: str = "", long_term: str = "",
+                           system_prompt: str = "") -> str:
+    """基于已有印象 + 最近对话 + 记忆摘要，更新并返回对用户的整体印象画像。
+
+    会把【人设/system_prompt】一并喂入，并要求 LLM **不要重复人设里已经写过的内容**，
+    只记录从真实相处中"学到的、人设里没有的"新信息，避免印象与人设冗余。
+    """
     system_template = (
-        "你是一个长期陪伴用户的 AI。请基于【已有印象】【会话摘要】【更早的长期记忆】"
-        "和【最近的对话】，更新你对哥哥的整体印象画像：性格、习惯、当前状态、在意的事、关系动态、"
-        "需要注意的点等。要求：用中文；保留仍然成立的旧印象，融合新信息，修正过时内容；"
-        "高度凝练，只保留最稳定、最关键的特征，总共不超过150字；可以是几条短要点或一小段话；"
-        "只输出印象本身，不要解释、不要寒暄、不要加时间戳。"
+        "你是一个长期陪伴用户（哥哥）的 AI。请更新你对哥哥的印象画像。\n"
+        "【最重要】下面会给你一份【已知人设】——里面已经写过的设定、性格、背景，绝对不要再写进印象里。"
+        "印象只记录你从真实相处中**新观察到、人设里没有的**信息：他最近的状态、具体习惯、在意的事、"
+        "关系里的小细节、需要注意的点等。\n"
+        "要求：用中文；保留仍成立的旧印象、融合新信息、删掉过时或与人设重复的内容；"
+        "极度凝练，最多 3 条短要点、总共不超过 100 字；只输出印象本身，不要解释、不要寒暄、不要加时间戳。"
     )
     convo = ""
     for c in history:
         convo += f"[{c.role}] {c.content}\n"
     user_template = (
+        "【已知人设（不要重复其中内容）】\n{persona}\n\n"
         "【已有印象】\n{prior}\n\n【会话摘要】\n{summary}\n\n【更早的长期记忆】\n{long_term}\n\n"
-        "【最近的对话】\n{convo}\n\n【你的任务】综合以上，输出更新后的“对用户的印象”。"
+        "【最近的对话】\n{convo}\n\n"
+        "【你的任务】综合以上，输出更新后的“对用户的印象”，且不得包含人设里已有的信息。"
     )
     prompt_template = ChatPromptTemplate.from_messages(
         [("system", system_template), ("user", user_template)]
     )
-    result = prompt_template.invoke({"prior": prior_impression or "（暂无）",
+    result = prompt_template.invoke({"persona": (system_prompt or "（无）").strip(),
+                                     "prior": prior_impression or "（暂无）",
                                      "summary": session_summary or "（暂无）",
                                      "long_term": long_term or "（暂无）",
                                      "convo": convo or "（暂无）"})

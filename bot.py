@@ -774,9 +774,11 @@ class ZerolanLiveRobot(BaseBot):
         long_term = self._long_term_memory
         prior = self._user_impression
 
+        persona = self.llm_prompt_manager.system_prompt
+
         def work():
             try:
-                new_imp = update_user_impression(prior, recent, summary, long_term)
+                new_imp = update_user_impression(prior, recent, summary, long_term, persona)
                 if new_imp and new_imp.strip():
                     self._user_impression = new_imp.strip()
                     logger.info(f"User impression updated ({len(self._user_impression)} chars).")
@@ -817,16 +819,23 @@ class ZerolanLiveRobot(BaseBot):
         except Exception as e:
             logger.debug(f"Publish memory snapshot skipped: {e}")
 
+    @staticmethod
+    def _cn_weekday(t=None) -> str:
+        """中文星期（周一~周日）。"""
+        return "周" + "一二三四五六日"[(t or time.localtime()).tm_wday]
+
     def _section_current_time(self) -> str:
-        """当前时间：让 AI 感知"现在几点"。每次构建查询时刷新。"""
+        """当前时间：让 AI 感知"现在几点、星期几"。每次构建查询时刷新。年份暂不展示。"""
         if not self._mem_cfg.inject_timestamp:
             return ""
-        return "# 当前时间\n" + time.strftime("%Y-%m-%d %A %H:%M:%S", time.localtime())
+        t = time.localtime()
+        return "# 当前时间\n" + time.strftime(f"%m-%d {self._cn_weekday(t)} %H:%M:%S", t)
 
     @staticmethod
     def _now_ts() -> str:
-        """轮次时间戳（紧凑本地时间），写进 Conversation.metadata。"""
-        return time.strftime("%m-%d %H:%M", time.localtime())
+        """轮次时间戳（紧凑本地时间，含星期），写进 Conversation.metadata。"""
+        t = time.localtime()
+        return time.strftime(f"%m-%d {ZerolanLiveRobot._cn_weekday(t)} %H:%M", t)
 
     def _section_state(self) -> str:
         """L3a 当前状态：大脑的瞬态"内部感受"（心情/模式）。"""
@@ -1127,7 +1136,7 @@ class ZerolanLiveRobot(BaseBot):
     # （存进去下一轮会再被加一层前缀，越滚越多）。
     _LEAD_TS_RE = re.compile(
         r'^\s*(?:'
-        r'[\[(（【]\s*\d{1,4}[\d\s\-:：月日年/]*\d\s*[\])）】]'  # 括号包裹：[06-07 18:19] (14:30) 【14:30】
+        r'[\[(（【]\s*\d{1,4}[\d\s\-:：月日年/周星期一二三四五六]*\d\s*[\])）】]'  # 括号包裹：[06-07 周日 18:19] (14:30) 【14:30】
         r'|\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:\s+\d{1,2}[:：]\d{2}(?:[:：]\d{2})?)?'  # 2026-06-07 14:30:00
         r'|\d{1,2}[-/月]\d{1,2}[日]?\s+\d{1,2}[:：]\d{2}(?:[:：]\d{2})?'  # 06-07 14:30
         r')\s*'
