@@ -17,7 +17,9 @@ from event.event_emitter import emitter
 class SmartMicrophone(ThreadRunnable):
     def __init__(self, enable_vad: bool = False, vad_mode=3, frame_duration=30,
                  silence_hangover_ms: int = 800, min_speech_ms: int = 1000,
-                 playback_tail_ms: int = 400, energy_ref: float = 3000.0):
+                 playback_tail_ms: int = 400, energy_ref: float = 3000.0,
+                 full_duplex: bool = False, echo_canceller=None,
+                 playback_speech_prob: float = 0.7):
         """
         初始化智能麦克风类
         :param enable_vad: 是否启用 webrtcvad 进行语音端点检测。开启后讲话间隔超过
@@ -31,6 +33,14 @@ class SmartMicrophone(ThreadRunnable):
         :param playback_tail_ms: 半双工回声抑制的"尾巴"时长。机器人通过扬声器播放完音频后，
                                  还要再额外抑制麦克风这么多毫秒，用来覆盖混响和音频缓冲的残留，
                                  避免机器人自己的尾音被 VAD 当作用户输入重新采集。
+        :param full_duplex: 全双工模式。开启后机器人说话期间麦克风**不再丢帧**，而是用
+                            `echo_canceller` 对每帧做回声消除后继续 VAD，从而能听到用户插话。
+                            覆盖半双工的 playback gate。
+        :param echo_canceller: `devices.aec.EchoCanceller` 实例（或 None）。仅在 `full_duplex`
+                               且其 `available` 为真时生效；否则自动退回半双工丢帧。
+        :param playback_speech_prob: 全双工下，机器人正在播放时，AEC 语音概率需达到该阈值
+                                     (0~1) 才把该帧当作用户语音，用来拒绝消不干净的残余回声。
+                                     设为 0 关闭该额外过滤。
         """
         super().__init__()
         self._enable_vad = enable_vad
@@ -92,6 +102,15 @@ class SmartMicrophone(ThreadRunnable):
         # 播放结束后允许恢复采集的单调时间戳（monotonic seconds）
         self._suppress_until = 0.0
 
+        # 全双工回声消除（AEC）：开启后播放期间不丢帧，而是对每帧做回声消除后继续 VAD，
+        # 使机器人能在自己说话时听见用户插话（barge-in 的采集基础）。
+        self._aec = echo_canceller
+        self._full_duplex = bool(full_duplex) and (self._aec is not None) and self._aec.available
+        self._playback_speech_prob = max(0.0, min(1.0, playback_speech_prob))
+        if full_duplex and not self._full_duplex:
+            logger.warning("Full-duplex requested but echo canceller unavailable; "
+                           "falling back to half-duplex echo suppression.")
+
     @property
     def is_recording(self):
         # return self._pause_event.is_set() and (not self._stop_flag) and self._stream.is_active()
@@ -101,6 +120,10 @@ class SmartMicrophone(ThreadRunnable):
         super().start()
         # self._pause_event.set()
         self._stop_flag = False
+        # 全双工：启动回声消除器（含 WASAPI 回采线程）。启动失败则自动退回半双工。
+        if self._full_duplex:
+            if not self._aec.start():
+                self._full_duplex = False
         try:
             while not self._stop_flag:
                 # self._pause_event.wait()
@@ -113,6 +136,11 @@ class SmartMicrophone(ThreadRunnable):
 
                 data = self._stream.read(self._chunk_size, exception_on_overflow=False)
 
+                # 全双工：先做回声消除，把机器人自己的声音从这一帧里减掉，再交给 VAD。
+                # （process 必须在采集线程调用——这里正是采集线程。）
+                if self._full_duplex:
+                    data = self._aec.process(data)
+
                 # 锁防止 hotkey 线程强制释放时同时读取
                 with self._recording_lock:
                     self._vad_record(data)
@@ -120,6 +148,11 @@ class SmartMicrophone(ThreadRunnable):
         except Exception as e:
             logger.exception(e)
         finally:
+            if self._aec is not None:
+                try:
+                    self._aec.stop()
+                except Exception as e:
+                    logger.exception(e)
             # Stop and close the microphone stream
             self._stream.stop_stream()
             self._stream.close()
@@ -145,18 +178,28 @@ class SmartMicrophone(ThreadRunnable):
                 self._suppress_until = time.monotonic() + self._playback_tail_s
 
     def _vad_record(self, data: bytes):
-        # 半双工抑制：播放期间（及尾巴时间内）采集到的都是机器人自己的声音，直接丢弃，
+        playback_active = self._is_playback_suppressed()
+
+        # 半双工：播放期间（及尾巴时间内）采集到的都是机器人自己的声音，直接丢弃，
         # 并清空已经累积的片段，避免把自己的输出当成用户输入发给 ASR。
-        if self._is_playback_suppressed():
+        # 全双工：`data` 已在采集循环里做过回声消除，不丢帧，照常走 VAD。
+        if playback_active and not self._full_duplex:
             if self._is_speaking or self._audio_frames:
                 self._reset_vad_state()
             return
 
-        # 更新能量 EMA（仅在非抑制帧上，避免把机器人自己的声音算进环境能量）。
+        # 更新能量 EMA（半双工下仅在非抑制帧上；全双工下用的是已消回声的帧）。
         self._update_energy(data)
 
         if self._enable_vad:
             is_speech = self._vad.is_speech(data, self._sample_rate)
+
+            # 全双工 + 正在播放：用 AEC 的语音概率再过一道门，拒绝消不干净的残余回声，
+            # 避免机器人把自己的尾音当成用户输入。
+            if is_speech and playback_active and self._full_duplex \
+                    and self._playback_speech_prob > 0.0 and self._aec is not None:
+                if self._aec.last_speech_prob < self._playback_speech_prob:
+                    is_speech = False
 
             if is_speech:
                 if not self._is_speaking:

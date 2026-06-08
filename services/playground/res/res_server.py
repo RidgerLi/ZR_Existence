@@ -288,9 +288,8 @@ _BRAIN_DASHBOARD_HTML = r"""<!DOCTYPE html>
     <h3 class="sub">对用户的印象</h3><div class="mem-sum" id="impression">-</div>
     <h3 class="sub">长期目标</h3><ul class="goals" id="goals"></ul>
     <h3 class="sub">待办清单</h3><ul class="todo" id="todos"></ul>
-    <h3 class="sub">最近聊天回顾 (温区)</h3><div class="mem-sum" id="digest">-</div>
-    <h3 class="sub">会话摘要 (L3b)</h3><div class="mem-sum" id="summary">-</div>
-    <h3 class="sub">向量库 / 检索 (L2b)　<span class="k">库条数</span> <b id="veccount">-</b></h3>
+    <h3 class="sub">近期回顾 (温区 · 近期线性记忆)</h3><div class="mem-sum" id="digest">-</div>
+    <h3 class="sub">长期记忆 / 向量库检索 (L2b)　<span class="k">库条数</span> <b id="veccount">-</b></h3>
     <div class="kv"><span class="k">query</span> <span id="vecquery">-</span></div>
     <div class="turns" id="vechits"></div>
     <h3 class="sub">工作窗口最近对话</h3><div class="turns" id="turns"></div>
@@ -363,7 +362,6 @@ async function tickMemory(){
       ? m.todolist.map(t=>`<li class="${t.done?'done':''}">${t.done?'☑':'☐'} ${esc(t.text)}</li>`).join('')
       : '<li class="k">（空）</li>';
     document.getElementById('digest').textContent = m.recent_digest || '（暂无）';
-    document.getElementById('summary').textContent = m.session_summary || '（暂无）';
     document.getElementById('veccount').textContent = (m.vec_count!=null && m.vec_count>=0)?m.vec_count:'-';
     document.getElementById('vecquery').textContent = m.vec_query || '（暂无）';
     document.getElementById('vechits').innerHTML = (m.vec_hits&&m.vec_hits.length)

@@ -65,33 +65,25 @@ class BrainConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
-    """分层记忆配置（工作窗口由 character.chat.max_history 控制；这里是其后的压缩/入库/检索旋钮）。
+    """分层记忆配置（串行管线；工作窗口由 character.chat.max_history 控制）。
 
-    三层：L0 工作窗口（max_history 条逐字真实对话）→ L3b 会话摘要（轻压缩）→ L2b 长期记忆（重压缩 + 向量库）。
+    串行三层：
+        热区 hot（hot_window_size 条逐字真实对话，直接发 LLM）
+          → 温区 recent_digest（窗口内、热区之外的较早原文，整理成保真的"近期回顾"，常驻 prompt，唯一的近期线性记忆）
+          → 长期记忆 L2b（被滑出整个窗口的原文，逐条原样写入向量库，按语义检索 top-k 回拼）。
     """
     enable: bool = Field(default=True,
-                         description="Master switch for the layered memory system (session summary + long-term vector memory). "
+                         description="Master switch for the layered memory system (recent digest + long-term vector memory). "
                                      "When False, only the sliding-window working memory (character.chat.max_history) is kept.")
     inject_timestamp: bool = Field(default=True,
                                    description="Stamp each real conversation turn with a local timestamp and inject a '当前时间' "
                                                "section + per-turn time prefixes into the LLM prompt, so the AI is time-aware "
                                                "(knows 'now' and how long ago each turn was said). Few-shot examples are not stamped.")
-    light_interval_s: float = Field(default=60.0,
-                                    description="L3b session-summary thread period (seconds). How often the background light "
-                                                "compression folds evicted turns into the running session summary.")
-    light_min_pending: int = Field(default=4,
-                                   description="Minimum number of evicted turns buffered before a light compression fires "
-                                               "(avoids calling the summarizer LLM too frequently).")
-    # --- Phase 3b: 长期记忆 / 向量库 ---
-    long_term_threshold: int = Field(default=40,
-                                     description="When the count of evicted real turns accumulated reaches this, the oldest block is "
-                                                 "heavily summarized and written into the vector DB (long-term memory).")
+    # --- 长期记忆 / 向量库（逐条原文入库 + 语义检索）---
     retrieve_top_k: int = Field(default=2,
-                                description="Number of long-term memory chunks retrieved from the vector DB per turn and injected into the prompt.")
+                                description="Number of long-term memory lines retrieved from the vector DB per turn and injected into the prompt.")
     collection_name: str = Field(default="history_collection",
-                                 description="Milvus collection name used for long-term conversation memory.")
-    heavy_interval_s: float = Field(default=120.0,
-                                    description="L2b long-term thread period (seconds) for heavy compression + vector-DB insertion.")
+                                 description="Vector-DB collection name used for long-term conversation memory.")
     # --- Phase 3c: 自我编辑 ---
     enable_self_edit: bool = Field(default=True,
                                    description="Allow the LLM to edit its own long-term goals / todolist via the <self_update> "
@@ -133,6 +125,29 @@ class SystemConfig(BaseModel):
                                           description="Extra milliseconds to keep the microphone gated off AFTER local playback finishes. "
                                                       "Covers room reverberation and audio buffer drain so the bot's own trailing audio is not "
                                                       "picked up as user speech. Only effective when `enable_echo_suppression` is True.")
+    enable_full_duplex: bool = Field(default=False,
+                                     description="Full-duplex acoustic echo cancellation (AEC). When `True`, the microphone keeps capturing "
+                                                 "WHILE the bot is talking, and a WebRTC AEC3 canceller removes the bot's own voice from the "
+                                                 "mic signal using a WASAPI loopback of the speaker output as the reference signal. This is the "
+                                                 "foundation for barge-in (interrupting the bot by talking) and natural full-duplex chat. "
+                                                 "Overrides the half-duplex `enable_echo_suppression` gating (frames are cleaned instead of dropped). "
+                                                 "Requires `PyAudioWPatch` (Windows WASAPI loopback) and `pywebrtc-audio`; if either is missing it "
+                                                 "automatically falls back to half-duplex.")
+    aec_stream_delay_ms: int = Field(default=0,
+                                     description="AEC delay hint (ms): the delay between audio being written to the speaker and its echo appearing "
+                                                 "in the mic capture. 0 lets AEC3's internal estimator figure it out; providing a rough value "
+                                                 "(typically 80-200ms for speaker+room) helps the canceller converge faster. "
+                                                 "Only effective when `enable_full_duplex` is True.")
+    aec_loopback_device_index: int = Field(default=-1,
+                                           description="WASAPI loopback input-device index used as the AEC reference (run `python -m pyaudiowpatch` "
+                                                       "to list devices). -1 picks the loopback of the default system speakers. "
+                                                       "Only effective when `enable_full_duplex` is True.")
+    full_duplex_playback_speech_prob: float = Field(default=0.7,
+                                                    description="While the bot is playing audio in full-duplex mode, a captured frame is only treated "
+                                                                "as user speech when the AEC's speech probability is at/above this threshold (0.0-1.0). "
+                                                                "Rejects residual echo that survives cancellation so the bot does not transcribe its own "
+                                                                "trailing voice. Set to 0 to disable this extra gate. Only effective when "
+                                                                "`enable_full_duplex` is True.")
     enable_clause_split: bool = Field(default=True,
                                       description='If `True`, splits LLM responses into smaller clauses before sending to TTS service. '
                                                   'This enables faster audio generation and reduced latency for real-time applications. \n'
@@ -159,8 +174,8 @@ class SystemConfig(BaseModel):
                                            'a multi-drive bionic model (arousal / social need / expression urge), proactive speech and '
                                            'proactivity mode switching, plus a live monitoring dashboard.')
     memory: MemoryConfig = Field(default=MemoryConfig(),
-                                 description='Layered conversation memory: sliding-window working memory, background session summary '
-                                             '(light compression), long-term vector-DB memory (heavy compression + retrieval), '
+                                 description='Layered conversation memory (serial pipeline): verbatim hot window -> warm "recent digest" '
+                                             '-> long-term vector-DB memory (per-line raw ingest + semantic retrieval), '
                                              'per-turn timestamps, and LLM self-editable goals/todolist.')
 
 

@@ -96,15 +96,12 @@ class ZerolanLiveRobot(BaseBot):
         self._current_user_text: str = ""  # 最近一轮用户输入，供 L2b 长期记忆按语义检索
         self._mem_cfg = _config.system.memory
         self.memory = MemoryManager(
-            light_interval_s=self._mem_cfg.light_interval_s,
-            light_min_pending=self._mem_cfg.light_min_pending,
-            heavy_interval_s=self._mem_cfg.heavy_interval_s,
-            long_term_threshold=self._mem_cfg.long_term_threshold,
             hot_window_size=self._mem_cfg.hot_window_size,
             recent_digest_interval_s=self._mem_cfg.recent_digest_interval_s,
-            archive_sink=self._archive_to_vecdb,
+            vec_line_sink=self._ingest_line_to_vecdb,
         )
         if self._mem_cfg.enable:
+            # 被滑出整个工作窗口的原文 → 逐条过滤后入向量库（长期记忆 L2b）。
             self.llm_prompt_manager.set_evict_callback(self.memory.enqueue_evicted)
             # 温区"近期回顾"按当前工作窗口的较早段重建。
             self.memory.set_live_turns_provider(self.llm_prompt_manager.live_turns)
@@ -115,8 +112,6 @@ class ZerolanLiveRobot(BaseBot):
         _loaded = self.memory_store.load()
         if _loaded.turns:
             self.llm_prompt_manager.seed_live_turns(_loaded.turns)
-        if _loaded.session_summary:
-            self.memory.session_summary = _loaded.session_summary
         if _loaded.recent_digest:
             self.memory.recent_digest = _loaded.recent_digest
         # 对用户的印象（顶层 syspromt 的一块）+ 触发计数器，均随 memory.md 持久化。
@@ -138,7 +133,6 @@ class ZerolanLiveRobot(BaseBot):
             self._section_directives,
             self._section_user_impression,
             self._section_long_term_memory,
-            self._section_session_summary,
             self._section_recent_digest,
             self._section_state,
             self._section_tool_instructions,
@@ -175,23 +169,13 @@ class ZerolanLiveRobot(BaseBot):
                     threads.append(turn_thread)
 
             if self._mem_cfg.enable:
-                # 后台记忆整理（L3b 会话摘要）：把滑出工作窗口的对话增量轻压缩成会话摘要。
-                memory_thread = KillableThread(
-                    target=lambda: self.memory.run(lambda: self._timer_flag),
-                    daemon=True, name="MemoryThread")
-                threads.append(memory_thread)
-                # 温区"近期回顾"：把窗口内较早的那段对话轻压缩，缩短 prompt（工作窗口两段式）。
+                # 温区"近期回顾"：把窗口内较早的那段对话整理成保真回顾，作为 prompt 里唯一的近期线性记忆。
+                # （被滑出整个窗口的原文则在驱逐回调里逐条入向量库，无需独立线程。）
                 if self._mem_cfg.hot_window_size > 0:
                     digest_thread = KillableThread(
                         target=lambda: self.memory.run_recent_digest(lambda: self._timer_flag),
                         daemon=True, name="RecentDigestThread")
                     threads.append(digest_thread)
-                # 长期记忆（L2b）：累计够多后重压缩入向量库。仅当向量库可用时启动。
-                if self.vec_db is not None:
-                    archive_thread = KillableThread(
-                        target=lambda: self.memory.run_archive(lambda: self._timer_flag),
-                        daemon=True, name="MemoryArchiveThread")
-                    threads.append(archive_thread)
 
             if self.keyboard is not None:
                 keyboard_thread = KillableThread(target=self.keyboard.start, daemon=True, name="KeyboardThread")
@@ -720,24 +704,29 @@ class ZerolanLiveRobot(BaseBot):
             logger.debug(f"vec_db count skipped: {e}")
         return -1
 
-    def _archive_to_vecdb(self, summary_text: str) -> None:
-        """把重压缩后的长期记忆写入向量库（MemoryManager 重压缩线程回调）。带 None 与异常保护。"""
-        if self.vec_db is None or not (summary_text or "").strip():
+    def _ingest_line_to_vecdb(self, turn) -> None:
+        """把"被滑出整个工作窗口的单条原文"原样写入向量库（长期记忆 L2b，MemoryManager 驱逐回调）。
+        保留 谁说的 + 日期 + 原话，便于精确语义召回；带 None 与异常保护。
+        """
+        if self.vec_db is None or turn is None:
+            return
+        content = (getattr(turn, "content", "") or "").strip()
+        if not content:
             return
         try:
-            row = InsertRow(id=int(time.time() * 1000), text=summary_text, subject="history")
+            role = getattr(turn.role, "value", None) or str(turn.role)
+            who = "哥哥" if role == "user" else "你"
+            ts = (getattr(turn, "metadata", None) or "").strip()
+            day = ts.split(" ")[0] if ts else ""  # 只留日期，去掉具体时刻
+            text = f"{day} {who}：{content}".strip()
+            self._vec_seq = getattr(self, "_vec_seq", 0) + 1
+            row = InsertRow(id=int(time.time() * 1000) * 1000 + (self._vec_seq % 1000),
+                            text=text, subject="history")
             insert = MilvusInsert(collection_name=self._mem_cfg.collection_name, texts=[row])
             self.vec_db.insert(insert)
-            logger.info(f"Long-term memory inserted into '{self._mem_cfg.collection_name}'.")
+            logger.debug(f"Long-term line inserted into '{self._mem_cfg.collection_name}': {text[:40]}")
         except Exception as e:
-            logger.warning(f"Failed to insert long-term memory: {e}")
-
-    def _section_session_summary(self) -> str:
-        """L3b 会话摘要：被滑出工作窗口的对话经轻压缩后的浓缩（MemoryManager 维护）。"""
-        text = (self.memory.get_session_summary() or "").strip()
-        if not text:
-            return ""
-        return "# 之前聊过的内容回顾\n" + text
+            logger.warning(f"Failed to insert long-term line: {e}")
 
     def _section_user_impression(self) -> str:
         """对用户的印象：由后台线程每隔若干轮用 LLM 凝练，作为顶层人设的一块拼进 prompt。"""
@@ -751,7 +740,6 @@ class ZerolanLiveRobot(BaseBot):
         try:
             self.memory_store.request_save(MemoryState(
                 turns=self.llm_prompt_manager.live_turns(),
-                session_summary=self.memory.get_session_summary(),
                 recent_digest=self.memory.get_recent_digest(),
                 user_impression=self._user_impression,
                 turn_counter=self._turn_counter,
@@ -773,7 +761,7 @@ class ZerolanLiveRobot(BaseBot):
         """后台线程：用最近若干轮对话 + 会话摘要 + 长期记忆，请 LLM 更新对用户的印象并落盘。"""
         self._impression_updating = True
         recent = list(self.llm_prompt_manager.live_turns())[-self._impression_interval:]
-        summary = self.memory.get_session_summary()
+        summary = self.memory.get_recent_digest()  # 已无独立会话摘要，用温区回顾作为补充上下文
         long_term = self._long_term_memory
         prior = self._user_impression
 
@@ -806,7 +794,6 @@ class ZerolanLiveRobot(BaseBot):
                 role = getattr(c.role, "value", None) or str(c.role)
                 turns.append({"role": role, "content": c.content, "ts": c.metadata})
             memory_monitor.publish({
-                "session_summary": self.memory.get_session_summary(),
                 "recent_digest": self.memory.get_recent_digest(),
                 "user_impression": self._user_impression,
                 "long_term": self._long_term_memory,

@@ -1,78 +1,88 @@
 """
-分层记忆管理器（MemoryManager）
+分层记忆管理器（MemoryManager）—— 串行管线版
 Author: ZerolanLiveRobot
 
-承接 `LLMPromptManager` 滑动窗口裁掉的"真实对话"，做后台压缩与长期入库：
+承接 `LLMPromptManager` 滑动窗口的"真实对话"，做一条**串行**的记忆流水（不再双写）：
 
-    L3b 会话摘要（轻压缩）：被滑出工作窗口的对话，由后台轻线程用 `summary_history` 增量
-        折叠进一段 `session_summary`（关键节点/结论/承诺要点），回拼进 prompt（"之前聊过的内容"）。
+    热区 hot（逐字）：最近 hot_window_size 条原文，由 bot 直接发给 LLM。
 
-    L2b 长期记忆（事实抽取 + 向量库，Phase 3b）：真实对话累计很多后，最旧的大块经
-        `extract_durable_facts` 只抽"以后仍成立的耐久事实"写入向量库（Milvus history_collection）；
-        prompt 构建时按当前输入检索 top-k 回拼。刻意与会话摘要分离：摘要记"发生了什么"，
-        长期记忆记"以后还用得上的事实"，避免把一次性情节/瞬时状态当事实检索回来。
+    温区 warm（近期回顾 / recent_digest）：工作窗口内、热区之外的较早原文，由后台线程用
+        `light_digest` 整理成一份分时段、保真的客观回顾，常驻 prompt。这是 prompt 里唯一的
+        "近期线性记忆"（已取消独立会话摘要）。recent_digest 始终是温区当前原文的纯函数
+        （重建、不漂移），只在温区那段实际变化（且变化够一批）时才重新调 LLM。
+
+    长期记忆 L2b（向量库，逐条原文）：被滑出整个工作窗口的原文，经"价值过滤"后**逐条原样**
+        写入向量库（保真，便于精确语义召回），太短/无信息的发言直接丢弃。prompt 构建时按当前
+        输入检索 top-k 回拼（由 bot 负责）。
 
 线程安全：
-    - 被裁内容通过 `enqueue_evicted` 进入待压缩缓冲（加锁）。
-    - 后台 `run(should_continue)` 轻线程周期性把缓冲折叠进 `session_summary`；LLM 调用在锁外进行。
-    - `session_summary` 为不可变 str，读写都是原子赋值，读取无需加锁。
+    - 被裁内容通过 `enqueue_evicted` 即时过滤后写向量库（写库回调在锁外执行）。
+    - 后台 `run_recent_digest(should_continue)` 周期性重建 recent_digest；LLM 调用在锁外进行。
+    - `recent_digest` 为不可变 str，读写都是原子赋值，读取无需加锁。
 """
 
+import re
 import threading
 import time
 from typing import Callable, List
 
 from loguru import logger
-from zerolan.data.pipeline.llm import Conversation, RoleEnum
+from zerolan.data.pipeline.llm import Conversation
 
-from agent.api import summary_history, light_digest, extract_durable_facts
+from agent.api import light_digest
+
+
+# 价值过滤：去掉首尾空白后长度过短、或整句就是这些无信息口头语的发言，不写入向量库。
+_TRIVIAL_PHRASES = {
+    "嗯", "嗯嗯", "哦", "噢", "哦哦", "啊", "哎", "哎呀", "唉", "诶",
+    "好", "好的", "好好", "好啊", "行", "行吧", "可以", "对", "对啊", "是的", "是",
+    "知道了", "知道啦", "懂了", "明白", "明白了", "没事", "没有", "嗯哼", "哈", "哈哈",
+}
+_VEC_MIN_LEN = 6  # 去标点空白后长度小于此值直接丢弃
+
+
+def _is_low_value(text: str) -> bool:
+    """判断一条发言是否"没有入库价值"（纯口头语/过短）。"""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if s in _TRIVIAL_PHRASES:
+        return True
+    # 去掉标点/空白后再看长度，避免"好的。"这种被算成有效长度。
+    core = re.sub(r"[\s，。！？、~…,.!?·\-—\"'（）()【】\[\]]+", "", s)
+    if len(core) < _VEC_MIN_LEN and core in _TRIVIAL_PHRASES:
+        return True
+    if len(core) < _VEC_MIN_LEN:
+        return True
+    return False
 
 
 class MemoryManager:
     def __init__(self,
-                 light_interval_s: float = 60.0,
-                 light_min_pending: int = 4,
-                 heavy_interval_s: float = 120.0,
-                 long_term_threshold: int = 40,
-                 hot_window_size: int = 10,
+                 hot_window_size: int = 8,
                  recent_digest_interval_s: float = 30.0,
-                 summarizer: Callable[[List[Conversation]], str] | None = None,
+                 digest_min_delta: int = 4,
                  digester: Callable[[List[Conversation]], str] | None = None,
-                 archiver: Callable[[List[Conversation]], str] | None = None,
                  live_turns_provider: Callable[[], List[Conversation]] | None = None,
-                 archive_sink: Callable[[str], None] | None = None):
+                 vec_line_sink: Callable[[Conversation], None] | None = None):
         """
-        :param light_interval_s: 轻压缩线程的检查周期（秒）。
-        :param light_min_pending: 待压缩缓冲累计到多少条才触发一次轻压缩（避免频繁调 LLM）。
-        :param heavy_interval_s: 重压缩（长期入库）线程的检查周期（秒）。
-        :param long_term_threshold: 长期缓冲累计到多少条真实对话才触发一次重压缩 + 入库。
-        :param hot_window_size: 工作窗口中"逐字保留"的最近轮次数；其余在窗口内的较早轮次由温区摘要表示。
+        :param hot_window_size: 工作窗口中"逐字保留"的最近轮次数；其余在窗口内的较早轮次由温区回顾表示。
         :param recent_digest_interval_s: 温区"近期回顾"重建的检查周期（秒）。
-        :param summarizer: 会话摘要函数（关键节点要点），默认用 agent.api.summary_history。
-        :param digester: 温区轻压缩函数，默认用 agent.api.light_digest。
-        :param archiver: 长期记忆抽取函数（只抽耐久事实），默认用 agent.api.extract_durable_facts。
-                         与 summarizer 分离：会话摘要记"本次发生了什么"，长期记忆只记"以后仍成立的事实"。
+        :param digest_min_delta: 温区原文较上次重建至少新增这么多条，才重新调 LLM（批量，省调用）。
+        :param digester: 温区回顾整理函数，默认用 agent.api.light_digest。
         :param live_turns_provider: 返回当前工作窗口真实对话（用于切出温区那段）。
-        :param archive_sink: 把重压缩后的长期记忆文本落库的回调（由 bot 提供，写入向量库）。
+        :param vec_line_sink: 把"被驱逐的单条原文"写入向量库的回调（由 bot 提供）。
         """
-        self._light_interval_s = light_interval_s
-        self._light_min_pending = light_min_pending
-        self._heavy_interval_s = heavy_interval_s
-        self._long_term_threshold = long_term_threshold
         self._hot_window_size = hot_window_size
         self._recent_digest_interval_s = recent_digest_interval_s
-        self._summarizer = summarizer or self._default_summarize
+        self._digest_min_delta = max(1, digest_min_delta)
         self._digester = digester or self._default_digest
-        self._archiver = archiver or self._default_archive
         self._live_turns_provider = live_turns_provider
-        self.archive_sink = archive_sink
+        self.vec_line_sink = vec_line_sink
 
-        self._lock = threading.Lock()
-        self._pending: List[Conversation] = []      # 轻压缩缓冲（→ session_summary）
-        self._lt_buffer: List[Conversation] = []     # 长期缓冲（→ 重压缩入库）
-        self.session_summary: str = ""
-        self.recent_digest: str = ""                  # 温区轻摘要（窗口内较早轮次的"近期回顾"）
-        self._digest_sig = None                       # 上次温区内容签名，未变则不重复调 LLM
+        self.recent_digest: str = ""        # 温区回顾（窗口内较早轮次的"近期回顾"）
+        self._digest_sig = None             # 上次温区内容签名（条数 + 末条），未变则不重复调 LLM
+        self._digest_len = 0                # 上次重建时温区的条数（用于 digest_min_delta 批量判断）
 
     def set_live_turns_provider(self, provider: Callable[[], List[Conversation]]) -> None:
         self._live_turns_provider = provider
@@ -81,64 +91,27 @@ class MemoryManager:
         return self.recent_digest
 
     @staticmethod
-    def _default_summarize(items: List[Conversation]) -> str:
-        return summary_history(items).content
-
-    @staticmethod
     def _default_digest(items: List[Conversation]) -> str:
         return light_digest(items)
 
-    @staticmethod
-    def _default_archive(items: List[Conversation]) -> str:
-        return extract_durable_facts(items)
-
     def enqueue_evicted(self, turns: List[Conversation]) -> None:
-        """接收被滑出工作窗口的真实对话。同时进入轻压缩缓冲（→会话摘要）与长期缓冲（→重压缩入库）。
-        由 LLMPromptManager 的裁剪回调调用。
+        """接收被滑出整个工作窗口的真实对话：逐条做价值过滤后，原样写入向量库（长期记忆 L2b）。
+        由 LLMPromptManager 的裁剪回调调用。写库异常被吞掉，不影响主流程。
         """
-        if not turns:
+        if not turns or self.vec_line_sink is None:
             return
-        with self._lock:
-            self._pending.extend(turns)
-            self._lt_buffer.extend(turns)
-
-    def get_session_summary(self) -> str:
-        return self.session_summary
-
-    def run(self, should_continue: Callable[[], bool]) -> None:
-        """后台轻压缩循环：周期性把待压缩缓冲增量折叠进 session_summary。"""
-        logger.info("MemoryManager light-compression loop started.")
-        while should_continue():
-            time.sleep(self._light_interval_s)
+        for t in turns:
             try:
-                self._maybe_compress()
+                if _is_low_value(getattr(t, "content", "")):
+                    continue
+                self.vec_line_sink(t)
             except Exception as e:
-                logger.exception(e)
-        logger.info("MemoryManager light-compression loop stopped.")
-
-    def _maybe_compress(self) -> None:
-        with self._lock:
-            if len(self._pending) < self._light_min_pending:
-                return
-            batch = self._pending[:]
-            self._pending.clear()
-
-        items: List[Conversation] = []
-        old = self.session_summary
-        if old:
-            items.append(Conversation(role=RoleEnum.system, content="已有的对话摘要：" + old))
-        items.extend(batch)
-
-        new_summary = (self._summarizer(items) or "").strip()
-        if new_summary:
-            self.session_summary = new_summary
-            logger.debug(f"MemoryManager session summary updated ({len(new_summary)} chars).")
+                logger.debug(f"vec line ingest skipped: {e}")
 
     def run_recent_digest(self, should_continue: Callable[[], bool]) -> None:
-        """后台温区循环：把"窗口内较早的那段对话"（除最近 hot_window_size 条外）轻压缩成 recent_digest。
+        """后台温区循环：把"窗口内较早的那段对话"（除最近 hot_window_size 条外）整理成 recent_digest。
 
-        recent_digest 始终是温区当前内容的纯函数：温区为空则清空，温区内容变化才重新调 LLM。
-        因此不会与更老的 session_summary 重复表示同一批对话。
+        recent_digest 始终是温区当前内容的纯函数：温区为空则清空，温区内容变化（且达批量阈值）才重新调 LLM。
         """
         logger.info("MemoryManager recent-digest loop started.")
         while should_continue():
@@ -158,43 +131,18 @@ class MemoryManager:
             if self.recent_digest:
                 self.recent_digest = ""
                 self._digest_sig = None
+                self._digest_len = 0
             return
         sig = (len(older), older[-1].content, getattr(older[-1], "metadata", None))
         if sig == self._digest_sig:
-            return  # 温区那段没变，不必重复压缩
+            return  # 温区那段没变，不必重复整理
+        # 批量：温区内容虽变，但相比上次重建新增不足 digest_min_delta 条时，先攒着（除非是首次或缩短）。
+        if self.recent_digest and 0 < (len(older) - self._digest_len) < self._digest_min_delta \
+                and len(older) >= self._digest_len:
+            return
         digest = (self._digester(older) or "").strip()
         if digest:
             self.recent_digest = digest
             self._digest_sig = sig
+            self._digest_len = len(older)
             logger.debug(f"MemoryManager recent digest rebuilt ({len(digest)} chars, from {len(older)} turns).")
-
-    def run_archive(self, should_continue: Callable[[], bool]) -> None:
-        """后台重压缩循环：长期缓冲累计够多时，把最旧的一大块重压缩并落入向量库（长期记忆 L2b）。"""
-        logger.info("MemoryManager heavy-archive loop started.")
-        while should_continue():
-            time.sleep(self._heavy_interval_s)
-            try:
-                self._maybe_archive()
-            except Exception as e:
-                logger.exception(e)
-        logger.info("MemoryManager heavy-archive loop stopped.")
-
-    def _maybe_archive(self) -> None:
-        if self.archive_sink is None:
-            return
-        with self._lock:
-            if len(self._lt_buffer) < self._long_term_threshold:
-                return
-            # 取出最旧的一整块（阈值大小）做重压缩，剩余的留到下次。
-            block = self._lt_buffer[:self._long_term_threshold]
-            self._lt_buffer = self._lt_buffer[self._long_term_threshold:]
-
-        # 长期记忆只抽"耐久事实"，与会话摘要（关键节点流水）分离，避免把过期情节当事实入库。
-        digest = (self._archiver(block) or "").strip()
-        if not digest:
-            return
-        try:
-            self.archive_sink(digest)
-            logger.info(f"MemoryManager archived a long-term memory ({len(digest)} chars).")
-        except Exception as e:
-            logger.exception(e)

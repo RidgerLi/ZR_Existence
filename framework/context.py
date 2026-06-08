@@ -132,16 +132,34 @@ class ZerolanLiveRobotContext:
             from services.qqbot.napcat import QQBotService
 
             self.qq: QQBotService = QQBotService(_config.service.qqbot)
+        # 全双工回声消除（AEC）：开启后机器人说话期间麦克风持续采集，用 WebRTC AEC3 + WASAPI
+        # 回采参考信号把机器人自己的声音从麦克风信号里减掉，从而能听见用户插话（barge-in 的采集基础）。
+        # 依赖缺失时 EchoCanceller.available 为 False，麦克风会自动退回半双工。
+        echo_canceller = None
+        if _config.system.enable_full_duplex:
+            from devices.aec import EchoCanceller
+            # 30ms@16k = 480 samples/frame，与麦克风一致。
+            echo_canceller = EchoCanceller(
+                sample_rate=16000,
+                frame_samples=int(16000 * 30 / 1000),
+                stream_delay_ms=_config.system.aec_stream_delay_ms,
+                loopback_device_index=_config.system.aec_loopback_device_index,
+            )
+
         self.mic = SmartMicrophone(
             enable_vad=True,
             vad_mode=_config.system.microphone_vad_mode,
             playback_tail_ms=_config.system.echo_suppression_tail_ms,
             energy_ref=_config.system.brain.mic_energy_ref,
+            full_duplex=_config.system.enable_full_duplex,
+            echo_canceller=echo_canceller,
+            playback_speech_prob=_config.system.full_duplex_playback_speech_prob,
         )
 
-        # 半双工回声抑制：把扬声器的本地播放事件接到麦克风的门控上，
-        # 播放 TTS 期间关闭麦克风采集，避免机器人把自己输出的音频当成用户语音重新采集。
-        if _config.system.enable_echo_suppression:
+        # 把扬声器的本地播放事件接到麦克风的播放状态门控上：
+        # - 半双工（enable_echo_suppression）：播放期间丢弃麦克风帧，防止采集到自己的声音；
+        # - 全双工（enable_full_duplex）：播放期间不丢帧，但用该状态在播放期对残余回声做更严的过滤。
+        if _config.system.enable_full_duplex or _config.system.enable_echo_suppression:
             self.speaker.set_playback_hooks(self.mic.begin_playback, self.mic.end_playback)
 
         # Headless system can not load `pynput` and `pygame`
