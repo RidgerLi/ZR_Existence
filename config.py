@@ -154,7 +154,7 @@ class SystemConfig(BaseModel):
                                               "clears the queued TTS, and cancels the in-flight LLM/TTS generation. The user's interrupting utterance is "
                                               "then transcribed and answered as a fresh turn. Requires full-duplex (the mic must stay open while the bot "
                                               "talks); has no effect in half-duplex.")
-    barge_in_min_ms: int = Field(default=800,
+    barge_in_min_ms: int = Field(default=1200,
                                  description="How many milliseconds of CONFIDENT accumulated user speech (while the bot is playing) are required before a "
                                              "barge-in hard-cut fires. Short silences (consonants/breaths) shorter than the VAD silence hangover do NOT "
                                              "reset the count; a sustained silence does. Higher values are more robust against residual echo / coughs but "
