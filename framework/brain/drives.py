@@ -62,7 +62,9 @@ def default_mode_presets() -> Dict[str, DriveParams]:
             base_drive=0.0, fire_threshold=1.0,
             w_social=0.15, keyboard_suppress=1.0,
             social_rise_per_s=0.0015,
-            refractory_s=120.0, max_consecutive_fires=1,
+            # max_consecutive_fires=0：专注（含安静模式）下彻底不主动开口。
+            # _may_fire 里 `_consecutive_fires >= 0` 恒真，所以一次都不会发放。
+            refractory_s=120.0, max_consecutive_fires=0,
         ),
         "normal": DriveParams(
             base_drive=0.05, fire_threshold=1.0,
