@@ -154,6 +154,8 @@ class ZerolanLiveRobotContext:
             full_duplex=_config.system.enable_full_duplex,
             echo_canceller=echo_canceller,
             playback_speech_prob=_config.system.full_duplex_playback_speech_prob,
+            enable_barge_in=_config.system.enable_barge_in,
+            barge_in_min_ms=_config.system.barge_in_min_ms,
         )
 
         # 把扬声器的本地播放事件接到麦克风的播放状态门控上：

@@ -148,6 +148,17 @@ class SystemConfig(BaseModel):
                                                                 "Rejects residual echo that survives cancellation so the bot does not transcribe its own "
                                                                 "trailing voice. Set to 0 to disable this extra gate. Only effective when "
                                                                 "`enable_full_duplex` is True.")
+    enable_barge_in: bool = Field(default=True,
+                                  description="Barge-in (interrupting the bot by talking). When `True` and `enable_full_duplex` is on, the bot HARD-CUTS "
+                                              "its current speech the moment it confidently detects the user starting to talk: it stops playback, "
+                                              "clears the queued TTS, and cancels the in-flight LLM/TTS generation. The user's interrupting utterance is "
+                                              "then transcribed and answered as a fresh turn. Requires full-duplex (the mic must stay open while the bot "
+                                              "talks); has no effect in half-duplex.")
+    barge_in_min_ms: int = Field(default=180,
+                                 description="How many milliseconds of CONFIDENT continuous user speech (while the bot is playing) are required before a "
+                                             "barge-in hard-cut fires. Higher values are more robust against residual echo / coughs but make interruption "
+                                             "feel slower; lower values interrupt faster but risk false cuts. Only effective when `enable_barge_in` and "
+                                             "`enable_full_duplex` are True.")
     enable_clause_split: bool = Field(default=True,
                                       description='If `True`, splits LLM responses into smaller clauses before sending to TTS service. '
                                                   'This enables faster audio generation and reduced latency for real-time applications. \n'

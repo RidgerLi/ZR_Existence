@@ -19,7 +19,8 @@ class SmartMicrophone(ThreadRunnable):
                  silence_hangover_ms: int = 800, min_speech_ms: int = 1000,
                  playback_tail_ms: int = 400, energy_ref: float = 3000.0,
                  full_duplex: bool = False, echo_canceller=None,
-                 playback_speech_prob: float = 0.7):
+                 playback_speech_prob: float = 0.7,
+                 enable_barge_in: bool = False, barge_in_min_ms: int = 180):
         """
         初始化智能麦克风类
         :param enable_vad: 是否启用 webrtcvad 进行语音端点检测。开启后讲话间隔超过
@@ -41,6 +42,11 @@ class SmartMicrophone(ThreadRunnable):
         :param playback_speech_prob: 全双工下，机器人正在播放时，AEC 语音概率需达到该阈值
                                      (0~1) 才把该帧当作用户语音，用来拒绝消不干净的残余回声。
                                      设为 0 关闭该额外过滤。
+        :param enable_barge_in: 是否启用插话打断。仅在全双工下有效：机器人播放期间检测到用户
+                                连续说话达到 `barge_in_min_ms` 时，触发 `barge_in_cb` 回调（由
+                                上层执行停播+取消生成的硬打断）。
+        :param barge_in_min_ms: 触发打断所需的"播放期间连续语音"时长（毫秒）。越大越抗残余回声
+                                误触发但打断越慢，越小打断越快但可能误切。
         """
         super().__init__()
         self._enable_vad = enable_vad
@@ -111,6 +117,15 @@ class SmartMicrophone(ThreadRunnable):
             logger.warning("Full-duplex requested but echo canceller unavailable; "
                            "falling back to half-duplex echo suppression.")
 
+        # 插话打断（barge-in）：全双工下机器人说话时，检测到用户连续说话即触发回调，
+        # 由上层执行"停播 + 取消在途生成"的硬打断。回调由外部通过 set_barge_in_callback 注入。
+        self._enable_barge_in = bool(enable_barge_in)
+        self._barge_in_min_frames = max(1, barge_in_min_ms // frame_duration)
+        self._barge_in_cb = None
+        # 本次播放期内连续语音帧计数 / 是否已触发过（避免一次播放里重复触发）
+        self._pb_speech_frames = 0
+        self._barge_in_fired = False
+
     @property
     def is_recording(self):
         # return self._pause_event.is_set() and (not self._stop_flag) and self._stream.is_active()
@@ -177,6 +192,31 @@ class SmartMicrophone(ThreadRunnable):
             if self._playback_count == 0:
                 self._suppress_until = time.monotonic() + self._playback_tail_s
 
+    def set_barge_in_callback(self, cb):
+        """注入插话打断回调：在全双工播放期间检测到用户连续说话时被调用（无参）。"""
+        self._barge_in_cb = cb
+
+    def _detect_barge_in(self, playback_active: bool, is_speech: bool):
+        if not (self._enable_barge_in and self._full_duplex):
+            return
+        if not playback_active:
+            # 没在播放：重置计数与触发标记，让下一次播放可以重新被打断。
+            self._pb_speech_frames = 0
+            self._barge_in_fired = False
+            return
+        if is_speech:
+            self._pb_speech_frames += 1
+            if (not self._barge_in_fired) and self._pb_speech_frames >= self._barge_in_min_frames \
+                    and self._barge_in_cb is not None:
+                self._barge_in_fired = True
+                logger.info(f"Barge-in detected ({self._pb_speech_frames} speech frames during playback).")
+                try:
+                    self._barge_in_cb()
+                except Exception as e:
+                    logger.exception(e)
+        else:
+            self._pb_speech_frames = 0
+
     def _vad_record(self, data: bytes):
         playback_active = self._is_playback_suppressed()
 
@@ -200,6 +240,9 @@ class SmartMicrophone(ThreadRunnable):
                     and self._playback_speech_prob > 0.0 and self._aec is not None:
                 if self._aec.last_speech_prob < self._playback_speech_prob:
                     is_speech = False
+
+            # 插话打断检测：机器人正在播放时，用户连续说话达到阈值即触发硬打断回调。
+            self._detect_barge_in(playback_active, is_speech)
 
             if is_speech:
                 if not self._is_speaking:

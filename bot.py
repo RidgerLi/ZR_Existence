@@ -75,6 +75,12 @@ class ZerolanLiveRobot(BaseBot):
         self.conv_state.set_speaker_busy_probe(self.speaker.is_busy)
         # 同一时刻只允许一个轮次进入 LLM；其余输入被缓存到下一轮。
         self._turn_lock = threading.Lock()
+
+        # 插话打断（barge-in）取消令牌：被 `_on_barge_in` 置位后，在途的流式 LLM 生成与
+        # TTS 派发会尽快停止；每一轮回复开始时清除。仅在全双工 + enable_barge_in 时由麦克风触发。
+        self._cancel_event = threading.Event()
+        if self.mic is not None and _config.system.enable_barge_in:
+            self.mic.set_barge_in_callback(self._on_barge_in)
         # 轮次执行器：让"大脑"决定开口后把这一轮的 LLM 放到后台跑，大脑循环可继续 tick
         # （感知/内驱/面板不被一轮长回复阻塞）。单线程，保证轮次串行。
         self._turn_executor = ThreadPoolExecutor(max_workers=1)
@@ -558,6 +564,10 @@ class ZerolanLiveRobot(BaseBot):
             # Future and would otherwise be swallowed silently (no log, no crash). We
             # log it explicitly so TTS failures are always visible.
             try:
+                # 被插话打断：丢弃本子句，不再合成/排播。
+                if self._cancel_event.is_set():
+                    logger.debug(f"TTS skipped (barge-in): {text!r}")
+                    return
                 query = TTSQuery(
                     text=text,
                     text_language="auto",
@@ -569,6 +579,10 @@ class ZerolanLiveRobot(BaseBot):
                 prediction = self.tts.predict(query=query)
                 logger.info(f"TTS: {query.text}")
 
+                # 合成期间可能发生打断：合成完也别再排播。
+                if self._cancel_event.is_set():
+                    logger.debug(f"TTS discarded after synth (barge-in): {text!r}")
+                    return
                 self.play_tts(PipelineOutputTTSEvent(prediction=prediction, transcript=text))
             except Exception:
                 logger.exception(f"TTS failed for text: {text!r}")
@@ -953,6 +967,33 @@ class ZerolanLiveRobot(BaseBot):
         except Exception as e:
             logger.exception(e)
 
+    def _on_barge_in(self) -> None:
+        """插话硬打断：用户在机器人说话时开口，立即停播 + 清空 TTS 队列 + 取消在途 LLM/TTS 生成。
+
+        由麦克风线程在全双工播放期间检测到用户连续语音时回调。被打断的这一轮 AI 回复直接丢弃，
+        不写入历史；用户这句插话随后由 VAD→ASR 正常识别，并作为新的一轮立刻应答。
+        """
+        if not self.conv_state.is_ai_busy():
+            # 机器人其实没在说话/思考，无需打断（避免误触发）。
+            return
+        logger.info("⛔ Barge-in: interrupting current speech.")
+        # 1) 置取消令牌：让流式 LLM 循环与 TTS 派发尽快停下、不再排新音频。
+        self._cancel_event.set()
+        # 2) 停掉本地扬声器当前播放并清空待播队列。
+        try:
+            self.speaker.stop_now()
+        except Exception as e:
+            logger.exception(e)
+        # 3) 丢弃可能与已清空音频错位的字幕条目，避免后续字幕与语音对不上。
+        try:
+            while not self.subtitles_queue.empty():
+                self.subtitles_queue.get_nowait()
+        except Exception:
+            pass
+        # 4) 复位忙碌状态：在途 TTS 计数清零、结束思考态，让这句插话能作为新一轮立即应答。
+        self.conv_state.reset_tts()
+        self.conv_state.end_thinking()
+
     def _dispatch_user_utterance(self, text: str) -> None:
         """轮次锁入口：决定"现在这句话能不能马上回复"。
 
@@ -1020,6 +1061,9 @@ class ZerolanLiveRobot(BaseBot):
 
     def emit_llm_prediction(self, text, direct_return: bool = False) -> None | LLMPrediction:
         logger.debug("`emit_llm_prediction` called")
+        # 新一轮开始：清除上一轮可能残留的打断取消令牌。
+        if not direct_return:
+            self._cancel_event.clear()
 
         # Streaming voice path: stream LLM tokens, dispatch each clause to TTS as soon as
         # a punctuation mark is seen. This drastically lowers the time-to-first-speech
@@ -1079,6 +1123,10 @@ class ZerolanLiveRobot(BaseBot):
         self._persist_memory()
 
         if not direct_return:
+            # 被插话打断：放弃这次（非流式）回复的朗读派发。
+            if self._cancel_event.is_set():
+                logger.info("Blocking LLM reply aborted by barge-in.")
+                return None
             emitter.emit(PipelineOutputLLMEvent(prediction=prediction))
             logger.debug("LLMEvent emitted.")
         return prediction
@@ -1171,6 +1219,8 @@ class ZerolanLiveRobot(BaseBot):
           - `PipelineOutputLLMEvent` is NOT emitted: the streaming path drives TTS
             directly to avoid the duplicate split/dispatch logic in `llm_query_handler`.
         """
+        # 新一轮开始：清除上一轮可能残留的打断取消令牌。
+        self._cancel_event.clear()
         self._current_user_text = text
         query = LLMQuery(text=text, history=self._history_for_query())
         logger.info(f"LLM send: {query}")
@@ -1190,6 +1240,10 @@ class ZerolanLiveRobot(BaseBot):
         aborted = False
 
         for delta in self.llm.stream_predict(query):
+            # 被插话打断：立刻停止消费 LLM 流并放弃本轮（不写历史）。
+            if self._cancel_event.is_set():
+                logger.info("LLM streaming aborted by barge-in.")
+                return None
             if not first_token_logged:
                 logger.debug("LLM streaming: first delta received.")
                 first_token_logged = True
@@ -1211,6 +1265,11 @@ class ZerolanLiveRobot(BaseBot):
                 break
 
         if aborted:
+            return None
+
+        # 收尾前再查一次打断：若刚被插话打断，放弃尾句与历史提交。
+        if self._cancel_event.is_set():
+            logger.info("LLM streaming aborted by barge-in (before tail flush).")
             return None
 
         # Flush any trailing speakable text (strip a possible partial tool marker).
