@@ -120,10 +120,19 @@ class SmartMicrophone(ThreadRunnable):
         # 插话打断（barge-in）：全双工下机器人说话时，检测到用户连续说话即触发回调，
         # 由上层执行"停播 + 取消在途生成"的硬打断。回调由外部通过 set_barge_in_callback 注入。
         self._enable_barge_in = bool(enable_barge_in)
+        # 触发打断所需的"累计语音帧"（短静音不清零，见 _detect_barge_in）。直接按配置时长换算。
         self._barge_in_min_frames = max(1, barge_in_min_ms // frame_duration)
+        if self._enable_barge_in:
+            logger.info(
+                f"Barge-in min speech: {self._barge_in_min_frames} frames "
+                f"(~{self._barge_in_min_frames * frame_duration}ms)."
+            )
         self._barge_in_cb = None
-        # 本次播放期内连续语音帧计数 / 是否已触发过（避免一次播放里重复触发）
+        # 本次播放期内累计语音帧 / 末尾连续静音帧 / 是否已触发过（避免一次播放里重复触发）。
+        # 与主 VAD 同口径：统计"语音帧总数"，短于 hangover 的静音不清零，只有持续静音超过
+        # hangover 才认为这段插话结束并清零——否则 2000ms 阈值在真实说话的辅音/换气间隙下永远凑不满。
         self._pb_speech_frames = 0
+        self._pb_silence_frames = 0
         self._barge_in_fired = False
 
     @property
@@ -202,10 +211,12 @@ class SmartMicrophone(ThreadRunnable):
         if not playback_active:
             # 没在播放：重置计数与触发标记，让下一次播放可以重新被打断。
             self._pb_speech_frames = 0
+            self._pb_silence_frames = 0
             self._barge_in_fired = False
             return
         if is_speech:
             self._pb_speech_frames += 1
+            self._pb_silence_frames = 0
             if (not self._barge_in_fired) and self._pb_speech_frames >= self._barge_in_min_frames \
                     and self._barge_in_cb is not None:
                 self._barge_in_fired = True
@@ -215,7 +226,11 @@ class SmartMicrophone(ThreadRunnable):
                 except Exception as e:
                     logger.exception(e)
         else:
-            self._pb_speech_frames = 0
+            # 短静音（辅音/换气）不清零；只有持续静音超过 hangover 才认为这段插话结束。
+            self._pb_silence_frames += 1
+            if self._pb_silence_frames >= self._silence_hangover_frames:
+                self._pb_speech_frames = 0
+                self._pb_silence_frames = 0
 
     def _vad_record(self, data: bytes):
         playback_active = self._is_playback_suppressed()
