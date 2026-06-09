@@ -28,9 +28,11 @@ class SmartMicrophone(ThreadRunnable):
         :param vad_mode: Optionally, set its aggressiveness mode, which is an integer between 0 and 3.
                          0 is the least aggressive about filtering out non-speech, 3 is the most aggressive.
         :param frame_duration: A frame must be either 10, 20, or 30 ms in duration.
-        :param silence_hangover_ms: 连续多少毫秒静音后才认为一句话说完，默认 700ms。
-        :param min_speech_ms: 一句话至少要有多少毫秒的语音帧才会被发出去，默认 300ms。
-                              用来过滤 VAD 抖动产生的噪声小段。
+        :param silence_hangover_ms: 用户开始说话后，连续多少毫秒静音才认为这句话说完并发送 ASR，
+                                    默认 800ms（实际由 config.system.vad_silence_hangover_ms 配置注入）。
+                                    句中停顿短于该值不会结束本轮，调大可避免"话没说完就被抢话"。
+        :param min_speech_ms: 一句话至少要有多少毫秒的语音帧才会被发出去，默认 1000ms
+                              （由 config.system.vad_min_speech_ms 配置注入）。用来过滤 VAD 抖动产生的噪声小段。
         :param playback_tail_ms: 半双工回声抑制的"尾巴"时长。机器人通过扬声器播放完音频后，
                                  还要再额外抑制麦克风这么多毫秒，用来覆盖混响和音频缓冲的残留，
                                  避免机器人自己的尾音被 VAD 当作用户输入重新采集。

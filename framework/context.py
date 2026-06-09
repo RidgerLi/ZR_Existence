@@ -149,6 +149,8 @@ class ZerolanLiveRobotContext:
         self.mic = SmartMicrophone(
             enable_vad=True,
             vad_mode=_config.system.microphone_vad_mode,
+            silence_hangover_ms=_config.system.vad_silence_hangover_ms,
+            min_speech_ms=_config.system.vad_min_speech_ms,
             playback_tail_ms=_config.system.echo_suppression_tail_ms,
             energy_ref=_config.system.brain.mic_energy_ref,
             full_duplex=_config.system.enable_full_duplex,

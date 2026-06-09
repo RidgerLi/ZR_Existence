@@ -118,6 +118,16 @@ class SystemConfig(BaseModel):
     microphone_vad_mode: int = Field(default=3,
                                      description="Optionally, set its aggressiveness mode, which is an integer between 0 and 3. " \
                                                  "0 is the least aggressive about filtering out non-speech, 3 is the most aggressive.")
+    vad_silence_hangover_ms: int = Field(default=1200,
+                                         description="End-of-utterance silence delay (ms): AFTER you have started speaking, the VAD waits for "
+                                                     "this many milliseconds of CONTINUOUS silence before deciding your sentence is finished and "
+                                                     "sending it to ASR. Raise it (e.g. 1500-2000) if the bot keeps cutting in while you are still "
+                                                     "talking / pausing mid-sentence; lower it (e.g. 600-800) for snappier turn-taking. Short pauses "
+                                                     "(breaths, hesitations) shorter than this do NOT end the turn.")
+    vad_min_speech_ms: int = Field(default=1000,
+                                   description="Minimum total speech (ms) an utterance must contain to be sent to ASR. Utterances shorter than this "
+                                               "are treated as VAD jitter/noise and dropped. Lower it (e.g. 300-500) if short replies like '等一下' "
+                                               "are being ignored.")
     microphone_hotkey: str = Field(default='f8',
                                    description="Your microphone is set to be off when the program starts. One tap on this hotkey will change its status between on and off.\n" \
                                                "You can pick your own hotkey on Key names like: {} ...".format(
