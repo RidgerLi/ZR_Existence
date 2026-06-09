@@ -94,13 +94,13 @@ class MemoryConfig(BaseModel):
                                                  "update the durable 'impression of the user' from recent turns + summaries. "
                                                  "Set to 0 to disable.")
     # --- 工作窗口两段式：热区逐字 + 温区轻摘要（水位滑动窗口）---
-    hot_window_size: int = Field(default=8,
+    hot_window_size: int = Field(default=5,
                                  description="LOW watermark of the verbatim hot zone: after a compaction the hot zone falls back to "
                                              "this many most-recent real turns (kept VERBATIM, with timestamps). It is also the floor "
                                              "of the prompt's verbatim window. Older in-window turns are represented by a light 'recent "
                                              "digest'. The full working window (max_history) is still kept in memory/disk; this only "
                                              "affects what is sent to the LLM. Set to 0 to disable the split (send all).")
-    hot_high_watermark: int = Field(default=12,
+    hot_high_watermark: int = Field(default=8,
                                     description="HIGH watermark of the verbatim hot zone. Whenever the number of verbatim (not-yet-"
                                                 "digested) turns exceeds this, a background fold compresses the oldest of them into the "
                                                 "recent digest, bringing the hot zone back down to hot_window_size. Must be > hot_window_size. "

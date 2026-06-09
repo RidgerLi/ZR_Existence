@@ -666,17 +666,21 @@ class ZerolanLiveRobot(BaseBot):
         return "\n\n".join(blocks)
 
     def _section_tool_instructions(self) -> str:
-        """告知 LLM 如何用 <self_update> 工具自我编辑长期目标 / todolist。"""
+        """告知 LLM 如何用 <self_update> 维护长期目标 / todolist。
+
+        减负：仅在【已有目标或待办】时才附带这段说明，且措辞精简——空清单时这套格式对模型没有
+        即时用处，没必要每轮都占长度。（代价：完全没有任何目标/待办时，模型无法自举出第一条；
+        如需自举，可改为按周期附带。）
+        """
         if not self._mem_cfg.enable_self_edit:
+            return ""
+        if not (self.self_state.goals or self.self_state.todolist):
             return ""
         return (
             "# 自我管理工具\n"
-            "你可以维护自己的长期目标和待办清单。当确实需要新增/完成/删除目标或待办时，"
-            "在你这次回复的【最后】单独追加一行：\n"
-            '<self_update>{"add_goal": "...", "add_todo": "...", "done_todo": "...", '
-            '"remove_goal": "...", "remove_todo": "..."}</self_update>\n'
-            "各字段都可选、可只给需要的，值可以是字符串或字符串数组。没有变更时就不要输出这一行。"
-            "这一行不会被读出来，也不要在朗读内容里提及它或它的格式。"
+            "需要增删/完成目标或待办时，在回复最末单独追加一行（不朗读、也别提及它）：\n"
+            '<self_update>{"add_goal":"…","add_todo":"…","done_todo":"…","remove_goal":"…","remove_todo":"…"}</self_update>\n'
+            "字段都可选、值可为字符串或数组；无变更就别输出此行。"
         )
 
     def _section_long_term_memory(self) -> str:
