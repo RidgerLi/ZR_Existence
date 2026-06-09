@@ -102,17 +102,27 @@ class ConversationState:
 
     # ---- 综合忙碌判定 ------------------------------------------------------
     def is_ai_busy(self) -> bool:
+        return self.busy_breakdown()["busy"]
+
+    def busy_breakdown(self) -> dict:
+        """返回 AI 忙碌判定的分项状态，便于排查「无声却 busy」类问题。"""
         with self._lock:
-            if self._ai_thinking or self._inflight_tts > 0:
-                return True
+            thinking = self._ai_thinking
+            inflight_tts = self._inflight_tts
+        speaker_busy = False
         probe = self._speaker_busy_probe
         if probe is not None:
             try:
-                if probe():
-                    return True
+                speaker_busy = bool(probe())
             except Exception as e:
                 logger.exception(e)
-        return False
+        busy = thinking or inflight_tts > 0 or speaker_busy
+        return {
+            "busy": busy,
+            "thinking": thinking,
+            "inflight_tts": inflight_tts,
+            "speaker_busy": speaker_busy,
+        }
 
     # ---- 待处理输入缓冲 ----------------------------------------------------
     def push_pending(self, text: str) -> None:

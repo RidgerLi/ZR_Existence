@@ -102,8 +102,9 @@ class ZerolanLiveRobot(BaseBot):
         self._current_user_text: str = ""  # 最近一轮用户输入，供 L2b 长期记忆按语义检索
         self._mem_cfg = _config.system.memory
         self.memory = MemoryManager(
-            hot_window_size=self._mem_cfg.hot_window_size,
-            recent_digest_interval_s=self._mem_cfg.recent_digest_interval_s,
+            hot_low=self._mem_cfg.hot_window_size,
+            hot_high=self._mem_cfg.hot_high_watermark,
+            safety_interval_s=self._mem_cfg.recent_digest_interval_s,
             vec_line_sink=self._ingest_line_to_vecdb,
         )
         if self._mem_cfg.enable:
@@ -120,6 +121,9 @@ class ZerolanLiveRobot(BaseBot):
             self.llm_prompt_manager.seed_live_turns(_loaded.turns)
         if _loaded.recent_digest:
             self.memory.recent_digest = _loaded.recent_digest
+            # 还原温区覆盖计数：假定持久化时温区盖到了"低水位之前"的全部轮次，避免重启后逐字段把整窗重发。
+            _seeded_live = len(self.llm_prompt_manager.live_turns())
+            self.memory.seed_digest_len(max(0, _seeded_live - self._mem_cfg.hot_window_size))
         # 对用户的印象（顶层 syspromt 的一块）+ 触发计数器，均随 memory.md 持久化。
         self._user_impression: str = _loaded.user_impression
         self._turn_counter: int = _loaded.turn_counter
@@ -619,16 +623,22 @@ class ZerolanLiveRobot(BaseBot):
     def _history_for_query(self):
         """构造发给 LLM 的历史：用分层装配器在干净历史上重写 system 消息（人设+长远计划+记忆+状态）。
 
-        工作窗口两段式：只把最近 hot_window_size 条逐字发给 LLM（带时间戳），更早的在窗口内的轮次
-        改由"近期回顾(温区轻摘要)"层表示，以缩短 prompt、抑制幻觉。完整窗口仍留在 current_history
-        与磁盘上，本处只影响"发出去"的内容。返回拷贝，持久化历史不受影响。
+        工作窗口两段式：把"温区还没覆盖到的尾部轮次"逐字发给 LLM（带时间戳，至少 hot_low 条、随
+        折叠水位在 [hot_low, hot_high] 间浮动），更早的在窗口内的轮次改由"近期回顾(温区轻摘要)"层
+        表示，以缩短 prompt、抑制幻觉。逐字段始终衔接温区覆盖点，保证两层无缝、不漏轮次。完整窗口
+        仍留在 current_history 与磁盘上，本处只影响"发出去"的内容。返回拷贝，持久化历史不受影响。
         """
         hist = self.llm_prompt_manager.current_history
         base = len(self.llm_prompt_manager.injected_history)
         prefix, live = list(hist[:base]), list(hist[base:])
-        hot = self._mem_cfg.hot_window_size
-        if self._mem_cfg.enable and hot > 0 and len(live) > hot:
-            live = live[-hot:]
+        low = self._mem_cfg.hot_window_size
+        if self._mem_cfg.enable and low > 0 and len(live) > low:
+            # 逐字段必须覆盖"温区还没盖到的全部尾部轮次"，否则刚滑出热区、还没并进温区的
+            # 那几条会两头落空。keep = max(low, 未被温区覆盖的轮次数)，保证热区↔温区无缝。
+            covered = min(max(0, self.memory.digest_covered_count()), len(live))
+            keep = max(low, len(live) - covered)
+            if len(live) > keep:
+                live = live[-keep:]
         # 把"已说出口但还没被应答"的主动发言作为上下文带上，让 AI 应答时知道自己刚说了什么。
         # 它此时还没进 current_history（要等用户真的回复才落历史），所以只在这份发出去的拷贝里补上。
         if self._pending_proactive is not None:
@@ -765,6 +775,8 @@ class ZerolanLiveRobot(BaseBot):
     def _on_turn_committed(self, num_new: int) -> None:
         """每次提交对话后累加计数器；满 impression_interval 条就后台触发"对用户的印象"更新。"""
         self._turn_counter += max(0, int(num_new))
+        # 即时唤醒温区折叠：逐字未压缩轮次一旦越过高水位就尽快折叠，无需等安全周期。
+        self.memory.notify()
         if (self._mem_cfg.enable and self._impression_interval > 0
                 and not self._impression_updating
                 and self._turn_counter - self._last_impression_at >= self._impression_interval):
@@ -1015,7 +1027,12 @@ class ZerolanLiveRobot(BaseBot):
 
         with self._turn_lock:
             if self.conv_state.is_ai_busy():
-                logger.info(f"AI busy, buffer utterance for next turn: {text}")
+                bd = self.conv_state.busy_breakdown()
+                logger.info(
+                    f"AI busy, buffer utterance for next turn: {text} "
+                    f"(thinking={bd['thinking']}, inflight_tts={bd['inflight_tts']}, "
+                    f"speaker_busy={bd['speaker_busy']})"
+                )
                 self.conv_state.push_pending(text)
                 return
             # 占据本轮：在锁内置 thinking，确保并发到来的其它输入会看到"忙"。

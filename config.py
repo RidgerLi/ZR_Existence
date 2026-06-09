@@ -93,16 +93,22 @@ class MemoryConfig(BaseModel):
                                      description="Every this many committed conversation turns, a background thread asks the LLM to "
                                                  "update the durable 'impression of the user' from recent turns + summaries. "
                                                  "Set to 0 to disable.")
-    # --- 工作窗口两段式：热区逐字 + 温区轻摘要 ---
-    hot_window_size: int = Field(default=10,
-                                 description="Number of most-recent real turns kept VERBATIM (with timestamps) in the prompt. "
-                                             "Older in-window turns are replaced by a light 'recent digest' to shrink the prompt and "
-                                             "curb hallucination. The full working window (max_history) is still kept in memory/disk; "
-                                             "this only affects what is sent to the LLM. Set to 0 to disable the split (send all).")
+    # --- 工作窗口两段式：热区逐字 + 温区轻摘要（水位滑动窗口）---
+    hot_window_size: int = Field(default=8,
+                                 description="LOW watermark of the verbatim hot zone: after a compaction the hot zone falls back to "
+                                             "this many most-recent real turns (kept VERBATIM, with timestamps). It is also the floor "
+                                             "of the prompt's verbatim window. Older in-window turns are represented by a light 'recent "
+                                             "digest'. The full working window (max_history) is still kept in memory/disk; this only "
+                                             "affects what is sent to the LLM. Set to 0 to disable the split (send all).")
+    hot_high_watermark: int = Field(default=12,
+                                    description="HIGH watermark of the verbatim hot zone. Whenever the number of verbatim (not-yet-"
+                                                "digested) turns exceeds this, a background fold compresses the oldest of them into the "
+                                                "recent digest, bringing the hot zone back down to hot_window_size. Must be > hot_window_size. "
+                                                "The hot zone therefore floats within [hot_window_size, hot_high_watermark].")
     recent_digest_interval_s: float = Field(default=30.0,
-                                            description="Background period (seconds) for rebuilding the light 'recent digest' of the "
-                                                        "older in-window turns (dedupe + drop per-turn timestamps into a time range, "
-                                                        "keep key info). Only re-runs the LLM when that older portion actually changed.")
+                                            description="Safety re-check period (seconds) for the background digest-fold loop. Folds are "
+                                                        "primarily event-driven (triggered immediately after each committed turn); this "
+                                                        "interval is only a self-healing fallback, NOT the main trigger.")
 
 
 class SystemConfig(BaseModel):
