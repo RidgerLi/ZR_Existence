@@ -11,3 +11,6 @@ config.yaml
 /services/playground/proto/*_pb2*.py
 /napcat/
 ./launch_all.bat
+scripts/_inspect_chroma_standalone.py
+scripts/inspect_vector_memory.py
+scripts/inspect_vector_memory_sqlite.py

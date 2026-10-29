@@ -26,6 +26,8 @@ class SelfState:
         self._lock = threading.RLock()
         self.goals: List[str] = []
         self.todolist: List[dict] = []  # 每项 {"text": str, "done": bool}
+        # 你"通过"的修改意见（行为调整约定）。由面板审核写入，渲染进 system prompt。
+        self.adjustments: List[str] = []
         self.load()
 
     # ---------- 持久化 ----------
@@ -44,6 +46,7 @@ class SelfState:
                     elif isinstance(t, str) and t.strip():
                         todos.append({"text": t, "done": False})
                 self.todolist = todos
+                self.adjustments = [str(a) for a in data.get("adjustments", []) if str(a).strip()]
             except Exception as e:
                 logger.warning(f"Failed to load self_state from {self.path}: {e}")
 
@@ -52,7 +55,8 @@ class SelfState:
             try:
                 os.makedirs(os.path.dirname(self.path), exist_ok=True)
                 with open(self.path, "w", encoding="utf-8") as f:
-                    json.dump({"goals": self.goals, "todolist": self.todolist},
+                    json.dump({"goals": self.goals, "todolist": self.todolist,
+                               "adjustments": self.adjustments},
                               f, ensure_ascii=False, indent=2)
             except Exception as e:
                 logger.warning(f"Failed to save self_state to {self.path}: {e}")
@@ -67,7 +71,30 @@ class SelfState:
             if self.todolist:
                 lines = "\n".join(("- [x] " if t["done"] else "- [ ] ") + t["text"] for t in self.todolist)
                 blocks.append("# 你的待办清单\n" + lines)
+            if self.adjustments:
+                lines = "\n".join(f"- {a}" for a in self.adjustments)
+                blocks.append("# 近期调整约定（你最近答应的表达/行为调整）\n" + lines)
             return "\n\n".join(blocks)
+
+    # ---------- 审核通过的调整约定 ----------
+    def add_adjustment(self, text: str) -> bool:
+        text = str(text or "").strip()
+        if not text:
+            return False
+        with self._lock:
+            if text in self.adjustments:
+                return False
+            self.adjustments.append(text)
+            self.save()
+            return True
+
+    def remove_adjustment(self, text: str) -> bool:
+        with self._lock:
+            if text in self.adjustments:
+                self.adjustments.remove(text)
+                self.save()
+                return True
+            return False
 
     # ---------- 编辑 ----------
     def _has_todo(self, text: str) -> int:
@@ -78,7 +105,7 @@ class SelfState:
 
     def apply_update(self, update: dict) -> bool:
         """应用一组操作。支持的键（值为 str 或 str 列表）：
-        add_goal / remove_goal / add_todo / done_todo / remove_todo。
+        add_goal / remove_goal / add_todo / done_todo / undone_todo / remove_todo。
         返回是否发生了实际改动。
         """
         if not isinstance(update, dict):
@@ -111,6 +138,12 @@ class SelfState:
                 idx = self._has_todo(t)
                 if idx >= 0 and not self.todolist[idx]["done"]:
                     self.todolist[idx]["done"] = True
+                    changed = True
+            for t in as_list(update.get("undone_todo")):
+                t = str(t).strip()
+                idx = self._has_todo(t)
+                if idx >= 0 and self.todolist[idx]["done"]:
+                    self.todolist[idx]["done"] = False
                     changed = True
             for t in as_list(update.get("remove_todo")):
                 t = str(t).strip()

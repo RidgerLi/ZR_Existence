@@ -15,6 +15,7 @@ from common.io.file_type import AudioFileType
 from common.utils.audio_util import get_audio_real_format
 from event.event_data import DeviceScreenCapturedEvent, DeviceMicrophoneVADEvent
 from event.event_emitter import emitter
+from framework import control
 from manager.config_manager import get_config
 
 RESOURCE_TYPES = {
@@ -201,11 +202,55 @@ class ResourceServer(ThreadRunnable):
 
         @self.app.route("/brain/logs")
         def brain_logs():
-            return jsonify(log_monitor.get_logs())
+            return jsonify(log_monitor.get_logs(
+                category=request.args.get("category"),
+                level=request.args.get("level"),
+                q=request.args.get("q"),
+                limit=int(request.args.get("limit") or 500),
+            ))
 
         @self.app.route("/brain")
         def brain_dashboard():
             return Response(_BRAIN_DASHBOARD_HTML, mimetype="text/html")
+
+        # ---- 本地控制面：面板按钮 / 外部脚本都走这里（见 framework/control.py）----
+        def _control_allowed() -> bool:
+            if getattr(_config.service.res_server, "allow_remote_control", False):
+                return True
+            return (request.remote_addr or "") in ("127.0.0.1", "::1", "localhost")
+
+        @self.app.route("/control/state")
+        def control_state():
+            if not _control_allowed():
+                abort(403)
+            return jsonify(control.call("state"))
+
+        @self.app.route("/control/<action>", methods=["POST"])
+        def control_action(action: str):
+            if not _control_allowed():
+                abort(403)
+            payload = request.get_json(silent=True) or {}
+            return jsonify(control.call(action, payload))
+
+        # ---- 通用 API：GET/POST /api/<action>，动作名与 control.available() 一致 ----
+        @self.app.route("/api/<action>", methods=["GET", "POST"])
+        def api_action(action: str):
+            if not _control_allowed():
+                abort(403)
+            payload = dict(request.get_json(silent=True) or {}) if request.method == "POST" else {}
+            for k, v in request.args.items():
+                payload.setdefault(k, v)
+            return jsonify(control.call(action, payload))
+
+        @self.app.route("/journal/<day>")
+        def journal_view(day: str):
+            if not _control_allowed():
+                abort(403)
+            r = control.call("journal.get", {"day": day})
+            if not r.get("ok"):
+                abort(404)
+            return Response((r.get("result") or {}).get("markdown", ""),
+                            mimetype="text/plain; charset=utf-8")
 
     def start(self):
         super().start()
@@ -258,6 +303,34 @@ _BRAIN_DASHBOARD_HTML = r"""<!DOCTYPE html>
   .logs .row { white-space:pre-wrap; line-height:1.4; }
   .logs .t { color:#6e7681; }
   .lv-INFO{color:#79c0ff}.lv-DEBUG{color:#8b949e}.lv-WARNING{color:#ffa657}.lv-ERROR{color:#f85149}.lv-SUCCESS{color:#7ee787}.lv-CRITICAL{color:#f85149}
+  .btn { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
+  .btn:hover { border-color:#58a6ff; color:#79c0ff; }
+  .btn.on { border-color:#7ee787; color:#7ee787; }
+  .btn.active { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  .btn.danger:hover { border-color:#f85149; color:#f85149; }
+  .ctl-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; font-size:12px; }
+  .ctl-row input { flex:1; min-width:200px; background:#0d1117; border:1px solid #30363d; border-radius:6px; color:#e6edf3; padding:5px 8px; font:inherit; font-size:12px; }
+  .ctl-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  ul.todo li a, ul.goals li a { color:inherit; text-decoration:none; }
+  ul.todo li .del, ul.goals li .del { color:#6e7681; margin-left:6px; }
+  ul.todo li .del:hover, ul.goals li .del:hover { color:#f85149; }
+  .msg { font-size:12px; min-height:16px; color:#8b949e; }
+  select { background:#0d1117; border:1px solid #30363d; border-radius:6px; color:#e6edf3; padding:4px 6px; font:inherit; font-size:12px; }
+  textarea { background:#0d1117; border:1px solid #30363d; border-radius:6px; color:#e6edf3; padding:6px 8px; font:inherit; font-size:12px; width:100%; box-sizing:border-box; }
+  .review-item { border:1px solid #21262d; border-radius:8px; padding:10px; margin:8px 0; background:#0d1117; }
+  .review-item .q { color:#79c0ff; font-size:12px; margin-bottom:4px; white-space:pre-wrap; }
+  .review-item .a { color:#e6edf3; font-size:12px; margin-bottom:8px; white-space:pre-wrap; }
+  .review-item .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .review-item input { flex:1; min-width:140px; background:#161b22; border:1px solid #30363d; border-radius:6px; color:#e6edf3; padding:4px 8px; font:inherit; font-size:12px; }
+  .prop { border:1px solid #21262d; border-radius:8px; padding:10px; margin:8px 0; background:#0d1117; font-size:12px; }
+  .prop .t { color:#ffa657; font-weight:bold; margin-bottom:4px; }
+  .prop .b { color:#e6edf3; margin-bottom:8px; white-space:pre-wrap; }
+  .cap-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; border-bottom:1px solid #21262d; padding:8px 0; font-size:12px; }
+  .cap-row .n { color:#7ee787; min-width:120px; }
+  .cap-row .d { color:#8b949e; flex:1; min-width:200px; }
+  .cap-row input { min-width:120px; background:#0d1117; border:1px solid #30363d; border-radius:6px; color:#e6edf3; padding:3px 6px; font:inherit; font-size:12px; }
+  ul.todo li .x, ul.goals li .x { color:#6e7681; }
+  #rv-journals a { color:#79c0ff; }
 </style>
 </head>
 <body>
@@ -294,7 +367,86 @@ _BRAIN_DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="turns" id="vechits"></div>
     <h3 class="sub">工作窗口最近对话</h3><div class="turns" id="turns"></div>
   </div>
+  <div class="card full"><h2>Control 控制</h2>
+    <div class="ctl-row">
+      <span class="k">主动模式</span>
+      <button class="btn" data-mode="focus">安静</button>
+      <button class="btn" data-mode="normal">普通</button>
+      <button class="btn" data-mode="companion">陪聊</button>
+      <button class="btn" data-mode="auto">自动</button>
+      <span class="pill">当前 <b id="ctl-mode">-</b></span>
+      <button class="btn" id="ctl-mic">麦克风 -</button>
+      <button class="btn danger" id="ctl-stop">停止说话</button>
+    </div>
+    <div class="ctl-grid">
+      <div>
+        <h3 class="sub">待办清单（点方框完成 / × 删除）</h3>
+        <ul class="todo" id="ctl-todos"></ul>
+        <div class="ctl-row">
+          <input id="ctl-todo-input" placeholder="新增待办，回车提交"/>
+          <button class="btn" id="ctl-todo-add">添加</button>
+        </div>
+      </div>
+      <div>
+        <h3 class="sub">长期目标（× 删除）</h3>
+        <ul class="goals" id="ctl-goals"></ul>
+        <div class="ctl-row">
+          <input id="ctl-goal-input" placeholder="新增目标，回车提交"/>
+          <button class="btn" id="ctl-goal-add">添加</button>
+        </div>
+      </div>
+    </div>
+    <h3 class="sub">和她说话</h3>
+    <div class="ctl-row">
+      <input id="ctl-ask-input" placeholder="发一句话给她：当作你说的，会得到完整回复并朗读"/>
+      <button class="btn" id="ctl-ask">发送</button>
+      <button class="btn" id="ctl-say">只念这句</button>
+    </div>
+    <div class="msg" id="ctl-msg"></div>
+  </div>
+  <div class="card full"><h2>Review 打分 · 日报</h2>
+    <div class="ctl-row">
+      <button class="btn" id="rv-sample">抽 5 句打分</button>
+      <button class="btn" id="rv-propose">生成修改意见</button>
+      <button class="btn" id="rv-journal">生成今天的日报</button>
+      <span class="pill">今日 token <b id="tk-total">-</b>（<b id="tk-p">-</b> + <b id="tk-c">-</b>）</span>
+      <span class="pill">评分 <b id="rv-count">-</b>　均分 <b id="rv-avg">-</b></span>
+      <span class="pill">待打分 <b id="rv-remaining">-</b></span>
+    </div>
+    <div id="rv-list"></div>
+    <h3 class="sub">修改意见（通过的会写入"近期调整约定"，下一轮立刻生效）</h3>
+    <div id="rv-proposals"></div>
+    <h3 class="sub">最近日报</h3>
+    <div id="rv-journals" class="kv"></div>
+    <div class="msg" id="rv-msg"></div>
+  </div>
+  <div class="card full"><h2>Capabilities 本地能力</h2>
+    <div class="ctl-row">
+      <span class="k">目录 <code>capabilities/*.py</code>　·　新增文件自动发现，可在这里开关与试跑</span>
+      <button class="btn" id="cap-refresh">刷新</button>
+      <span class="msg" id="cap-msg"></span>
+    </div>
+    <div id="cap-list"></div>
+  </div>
   <div class="card full"><h2>Logs 日志</h2>
+    <div class="ctl-row">
+      <select id="log-cat">
+        <option value="">全部分类</option>
+        <option>VAD</option><option>INPUT</option><option>BOT</option><option>BRAIN</option>
+        <option>MEMORY</option><option>LLM</option><option>ASR</option><option>TTS</option>
+        <option>CONTROL</option><option>CAP</option><option>JOURNAL</option><option>TELEMETRY</option>
+        <option>UI</option><option>CONFIG</option><option>LIVE</option><option>OTHER</option>
+      </select>
+      <select id="log-level">
+        <option value="">全部级别</option>
+        <option value="DEBUG">DEBUG 及以上</option>
+        <option value="INFO" selected>INFO 及以上</option>
+        <option value="WARNING">WARNING 及以上</option>
+        <option value="ERROR">ERROR 及以上</option>
+      </select>
+      <input id="log-q" placeholder="搜索日志（正文 / 模块）…"/>
+      <span class="pill">显示 <b id="log-count">-</b> 条</span>
+    </div>
     <div class="logs" id="logs"></div>
   </div>
 </main>
@@ -348,7 +500,7 @@ async function drawChart(threshold){
       i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.stroke();
   });
 }
-function esc(s){ return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function tickMemory(){
   try{
     const m = await (await fetch('/brain/memory')).json();
@@ -373,14 +525,243 @@ async function tickMemory(){
 }
 async function tickLogs(){
   try{
-    const rows = await (await fetch('/brain/logs')).json();
+    const p = new URLSearchParams();
+    const cat = document.getElementById('log-cat').value;
+    const lvl = document.getElementById('log-level').value;
+    const q = document.getElementById('log-q').value.trim();
+    if(cat) p.set('category', cat);
+    if(lvl) p.set('level', lvl);
+    if(q) p.set('q', q);
+    p.set('limit', '500');
+    const rows = await (await fetch('/brain/logs?' + p.toString())).json();
     const box = document.getElementById('logs');
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     box.innerHTML = rows.map(r=>
-      `<div class="row"><span class="t">${esc(r.time)}</span> <span class="lv-${esc(r.level)}">${esc(r.level)}</span> ${esc(r.message)}</div>`).join('');
+      `<div class="row"><span class="t">${esc(r.time)}</span> <span class="lv-${esc(r.level)}">${esc(r.level)}</span> ` +
+      `<span style="color:#6e7681">[${esc(r.category||'OTHER')}]</span> ${esc(r.message)}</div>`).join('');
     if(atBottom) box.scrollTop = box.scrollHeight;
+    document.getElementById('log-count').textContent = rows.length;
   }catch(e){}
 }
+// ---------------- Control 控制面 ----------------
+let ctlState = {mic_on:false};
+function ctlMsg(text, ok){
+  const el = document.getElementById('ctl-msg');
+  el.textContent = text; el.style.color = ok ? '#7ee787' : '#f85149';
+}
+async function ctl(action, payload){
+  try{
+    const r = await (await fetch('/control/'+action, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload||{})
+    })).json();
+    if(r.ok){ ctlMsg('✔ ' + action + ' 完成', true); }
+    else { ctlMsg('✘ ' + action + ' 失败：' + (r.error||''), false); }
+    await tickControl();
+    return r;
+  }catch(e){ ctlMsg('✘ 请求失败：' + e, false); }
+}
+async function tickControl(){
+  try{
+    const r = await (await fetch('/control/state')).json();
+    if(!r || !r.ok) return;
+    const s = r.result || {};
+    ctlState = s;
+    document.getElementById('ctl-mode').textContent = s.mode || '-';
+    document.querySelectorAll('[data-mode]').forEach(b=>{
+      b.classList.toggle('active', b.dataset.mode === s.mode);
+    });
+    const mic = document.getElementById('ctl-mic');
+    mic.textContent = s.mic_on ? '麦克风 开' : '麦克风 关';
+    mic.classList.toggle('on', !!s.mic_on);
+    document.getElementById('ctl-todos').innerHTML = (s.todolist||[]).length
+      ? s.todolist.map(t=>`<li class="${t.done?'done':''}">`+
+          `<a href="#" data-act="todo.${t.done?'undone':'done'}" data-text="${esc(t.text)}">${t.done?'☑':'☐'}</a> `+
+          `${esc(t.text)} <a href="#" class="del" data-act="todo.remove" data-text="${esc(t.text)}">×</a></li>`).join('')
+      : '<li class="k">（空）</li>';
+    document.getElementById('ctl-goals').innerHTML = (s.goals||[]).length
+      ? s.goals.map(g=>`<li>${esc(g)} <a href="#" class="del" data-act="goal.remove" data-text="${esc(g)}">×</a></li>`).join('')
+      : '<li class="k">（空）</li>';
+  }catch(e){}
+}
+function ctlInit(){
+  document.querySelectorAll('[data-mode]').forEach(b=>
+    b.addEventListener('click', ()=>ctl('mode.set', {mode:b.dataset.mode})));
+  document.getElementById('ctl-mic').addEventListener('click', ()=>ctl('mic.set', {on: !ctlState.mic_on}));
+  document.getElementById('ctl-stop').addEventListener('click', ()=>ctl('stop', {}));
+  const addTodo = ()=>{ const el=document.getElementById('ctl-todo-input'); const v=el.value.trim();
+    if(v) ctl('todo.add', {text:v}).then(()=>{ el.value=''; }); };
+  const addGoal = ()=>{ const el=document.getElementById('ctl-goal-input'); const v=el.value.trim();
+    if(v) ctl('goal.add', {text:v}).then(()=>{ el.value=''; }); };
+  document.getElementById('ctl-todo-add').addEventListener('click', addTodo);
+  document.getElementById('ctl-todo-input').addEventListener('keydown', e=>{ if(e.key==='Enter') addTodo(); });
+  document.getElementById('ctl-goal-add').addEventListener('click', addGoal);
+  document.getElementById('ctl-goal-input').addEventListener('keydown', e=>{ if(e.key==='Enter') addGoal(); });
+  const ask = ()=>{ const el=document.getElementById('ctl-ask-input'); const v=el.value.trim();
+    if(v) ctl('ask', {text:v}).then(()=>{ el.value=''; }); };
+  document.getElementById('ctl-ask').addEventListener('click', ask);
+  document.getElementById('ctl-ask-input').addEventListener('keydown', e=>{ if(e.key==='Enter') ask(); });
+  document.getElementById('ctl-say').addEventListener('click', ()=>{
+    const el=document.getElementById('ctl-ask-input'); const v=el.value.trim();
+    if(v) ctl('speak', {text:v}); });
+  const listClick = e=>{
+    const el = e.target.closest('[data-act]'); if(!el) return;
+    e.preventDefault();
+    ctl(el.dataset.act, {text: el.dataset.text});
+  };
+  document.getElementById('ctl-todos').addEventListener('click', listClick);
+  document.getElementById('ctl-goals').addEventListener('click', listClick);
+}
+// ---------------- Review / 日报 / 能力 ----------------
+async function api(action, payload){
+  const opt = {method: payload ? 'POST' : 'GET', headers:{'Content-Type':'application/json'}};
+  if(payload) opt.body = JSON.stringify(payload);
+  const r = await (await fetch('/api/' + action, opt)).json();
+  if(!r.ok) throw new Error(r.error || 'failed');
+  return r.result;
+}
+function rvMsg(text, ok){
+  const el = document.getElementById('rv-msg');
+  el.textContent = text; el.style.color = ok ? '#7ee787' : '#f85149';
+}
+function rvItem(t){
+  return `<div class="review-item" data-id="${t.id}">
+    <div class="q">你：${esc(t.user_text)}</div>
+    <div class="a">她：${esc(t.reply)}</div>
+    <div class="row">
+      <select class="rv-score">${[1,2,3,4,5].map(n=>`<option value="${n}"${n===4?' selected':''}>${n} 分</option>`).join('')}</select>
+      <input class="rv-tags" placeholder="标签（可空）：太长 / 太冷 / 出戏 / 很好"/>
+      <input class="rv-comment" placeholder="备注（可空）"/>
+      <button class="btn rv-save">保存打分</button>
+    </div>
+  </div>`;
+}
+async function rvSample(){
+  try{
+    const r = await api('review.sample', {n:5});
+    document.getElementById('rv-list').innerHTML =
+      (r.turns||[]).length ? r.turns.map(rvItem).join('') : '<div class="k">没有待打分的句子了（或最近没有对话）。</div>';
+    document.getElementById('rv-remaining').textContent = (r.remaining!=null) ? r.remaining : '-';
+  }catch(e){ rvMsg('抽样失败：'+e.message, false); }
+}
+async function rvStats(){
+  try{
+    const r = await api('tokens.stats', {});
+    const t = r.tokens||{}, st = r.review_stats||{};
+    document.getElementById('tk-total').textContent = (t.total_tokens!=null) ? t.total_tokens : '-';
+    document.getElementById('tk-p').textContent = (t.prompt_tokens!=null) ? t.prompt_tokens : '-';
+    document.getElementById('tk-c').textContent = (t.completion_tokens!=null) ? t.completion_tokens : '-';
+    document.getElementById('rv-count').textContent = (st.count!=null) ? st.count : '-';
+    document.getElementById('rv-avg').textContent = (st.avg!=null) ? st.avg : '-';
+  }catch(e){}
+}
+async function rvLoadProposals(){
+  try{
+    const r = await api('proposal.list', {status:'pending'});
+    const list = r.proposals || [];
+    document.getElementById('rv-proposals').innerHTML = list.length ? list.map(p=>`
+      <div class="prop" data-pid="${p.id}">
+        <div class="t">${esc(p.title)}</div>
+        <div class="b">${esc(p.body)}</div>
+        <button class="btn p-accept" data-id="${p.id}">通过</button>
+        <button class="btn p-reject" data-id="${p.id}">忽略</button>
+      </div>`).join('') : '<div class="k">暂无待处理的修改意见。</div>';
+  }catch(e){}
+}
+async function rvLoadJournals(){
+  try{
+    const r = await api('journal.list', {limit:7});
+    const list = r.journals || [];
+    document.getElementById('rv-journals').innerHTML = list.length
+      ? list.map(j=>`<a href="/journal/${esc(j.day)}" target="_blank">${esc(j.day)}</a>`).join('　·　')
+      : '（还没有日报；点上面的「生成今天的日报」试试）';
+  }catch(e){}
+}
+async function rvGenerateProposals(){
+  rvMsg('正在根据评分生成修改意见…', true);
+  try{ await api('review.generate_proposals', {}); rvMsg('已生成，见下方列表。', true); await rvLoadProposals(); }
+  catch(e){ rvMsg('生成失败：'+e.message, false); }
+}
+async function rvWriteJournal(){
+  try{ const r = await api('journal.write', {}); rvMsg('日报已生成：'+r.path, true); await rvLoadJournals(); }
+  catch(e){ rvMsg('生成日报失败：'+e.message, false); }
+}
+document.getElementById('rv-sample').addEventListener('click', rvSample);
+document.getElementById('rv-propose').addEventListener('click', rvGenerateProposals);
+document.getElementById('rv-journal').addEventListener('click', rvWriteJournal);
+document.getElementById('rv-list').addEventListener('click', async e=>{
+  const btn = e.target.closest('.rv-save'); if(!btn) return;
+  const item = btn.closest('.review-item');
+  const payload = {
+    turn_id: Number(item.dataset.id),
+    score: Number(item.querySelector('.rv-score').value),
+    tags: item.querySelector('.rv-tags').value.trim(),
+    comment: item.querySelector('.rv-comment').value.trim(),
+  };
+  try{
+    await api('review.submit', payload);
+    item.remove();
+    rvMsg('已记录。', true);
+    await rvStats();
+  }catch(err){ rvMsg('保存失败：'+err.message, false); }
+});
+document.getElementById('rv-proposals').addEventListener('click', async e=>{
+  const b = e.target.closest('.p-accept,.p-reject'); if(!b) return;
+  const approve = b.classList.contains('p-accept');
+  try{
+    await api('proposal.decide', {id:Number(b.dataset.id), approve});
+    rvMsg(approve ? '已通过，写入「近期调整约定」。' : '已忽略。', true);
+    await rvLoadProposals();
+  }catch(err){ rvMsg('操作失败：'+err.message, false); }
+});
+
+async function capLoad(){
+  try{
+    const r = await api('capability.list', {});
+    if(!r.enabled){ document.getElementById('cap-list').innerHTML = '<div class="k">能力系统已在配置里关闭。</div>'; return; }
+    const caps = r.capabilities || [];
+    document.getElementById('cap-list').innerHTML = caps.length ? caps.map(c=>`
+      <div class="cap-row" data-name="${esc(c.name)}">
+        <span class="n">${esc(c.name)}</span>
+        <span class="d">${esc(c.description)}</span>
+        <span class="k">${c.runs} 次 · 平均 ${c.avg_ms}ms</span>
+        <input class="cap-args" value='{}' title='运行参数 JSON'/>
+        <button class="btn cap-run">运行</button>
+        <button class="btn cap-toggle">${c.enabled?'停用':'启用'}</button>
+      </div>`).join('') : '<div class="k">capabilities 目录下还没有 .py 能力。</div>';
+  }catch(e){ document.getElementById('cap-msg').textContent = '加载能力失败：'+e.message; }
+}
+document.getElementById('cap-refresh').addEventListener('click', capLoad);
+document.getElementById('cap-list').addEventListener('click', async e=>{
+  const row = e.target.closest('.cap-row'); if(!row) return;
+  const name = row.dataset.name;
+  try{
+    if(e.target.closest('.cap-toggle')){
+      const turningOff = e.target.textContent === '停用';
+      await api('capability.toggle', {name, enabled: !turningOff});
+      await capLoad();
+    }else if(e.target.closest('.cap-run')){
+      const args = row.querySelector('.cap-args').value || '{}';
+      const r = await api('capability.run', {name, args});
+      document.getElementById('cap-msg').textContent = `${name} → ${r.result}`;
+      document.getElementById('cap-msg').style.color = '#7ee787';
+      await capLoad();
+    }
+  }catch(err){
+    document.getElementById('cap-msg').textContent = '操作失败：'+err.message;
+    document.getElementById('cap-msg').style.color = '#f85149';
+  }
+});
+let _logTimer = null;
+document.getElementById('log-q').addEventListener('input', ()=>{
+  clearTimeout(_logTimer); _logTimer = setTimeout(tickLogs, 300);
+});
+document.getElementById('log-cat').addEventListener('change', tickLogs);
+document.getElementById('log-level').addEventListener('change', tickLogs);
+
+capLoad(); rvStats(); rvLoadProposals(); rvLoadJournals();
+
+ctlInit();
+setInterval(tickControl, 2000); tickControl();
 setInterval(tick, 300); tick();
 setInterval(tickMemory, 1500); tickMemory();
 setInterval(tickLogs, 1500); tickLogs();

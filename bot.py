@@ -1,8 +1,13 @@
 import asyncio
+import hashlib
+import json
 import os
+import random
 import re
 import threading
 import time
+from collections import deque
+from datetime import datetime
 from concurrent.futures.thread import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
@@ -15,7 +20,7 @@ from zerolan.data.pipeline.img_cap import ImgCapQuery
 from zerolan.data.pipeline.llm import LLMQuery, LLMPrediction, Conversation, RoleEnum
 from zerolan.data.pipeline.milvus import MilvusInsert, InsertRow, MilvusQuery
 from zerolan.data.pipeline.ocr import OCRQuery
-from zerolan.data.pipeline.tts import TTSQuery
+from zerolan.data.pipeline.tts import TTSQuery, TTSPrediction
 from zerolan.data.pipeline.vla import ShowUiQuery
 
 from agent.api import sentiment_analyse, translate, summary_history, find_file, model_scale, sentiment_score, \
@@ -35,7 +40,11 @@ from event.event_data import DeviceMicrophoneVADEvent, DeviceKeyboardPressEvent,
     PipelineOCREvent, SecondEvent, ConfigFileModifiedEvent, LiveStreamDanmakuEvent, DeviceSpeakerPlayEvent
 from event.event_emitter import emitter
 from event.registry import EventKeyRegistry
+from framework import backchannel as bc
+from framework import control, journal, telemetry
 from framework.base_bot import BaseBot
+from framework.capabilities import CapabilityManager
+from framework.local_commands import parse_local_command
 from framework.conversation_state import ConversationState
 from framework.brain.brain import Brain
 from framework.brain.drives import DriveSystem
@@ -66,6 +75,16 @@ class ZerolanLiveRobot(BaseBot):
         self.enable_split_by_punc = _config.system.enable_clause_split
         self.enable_streaming_llm = _config.system.enable_streaming_llm
         self.subtitles_queue = Queue()
+
+        # 垫话（backchannel）：用户这句刚被 ASR 识别出来、LLM 还没开口时，先播一小句。
+        # 说什么由 resources/backchannel.json 决定（热加载），音频按当前音色预热到磁盘缓存。
+        self._bc_cfg = _config.system.backchannel
+        self._bc_last_play = 0.0
+        self._bc_script = None
+        self._bc_script_mtime = None
+        self._bc_recent: deque = deque(maxlen=3)
+        self._bc_synth_running = False
+        self._bc_lock = threading.Lock()
 
         # 对话轮次管理：把"AI 是否在忙"的状态集中起来，避免常开语音时一句话被 VAD 切碎后
         # 并发触发多次回复（详见 framework/conversation_state.py）。延迟优先：ASR 文字一出来
@@ -136,6 +155,17 @@ class ZerolanLiveRobot(BaseBot):
         self.tool_registry = ToolRegistry()
         self.tool_registry.register("update_self", self.self_state.apply_update)
 
+        # 遥测与审计：token 用量 / 每轮对话 / 打分 / 修改意见 / 能力调用 / 日报（本地 SQLite）。
+        self._sr_cfg = _config.system.self_review
+        telemetry.init(self._sr_cfg.db_path)
+        if self._sr_cfg.backfill_history:
+            self._backfill_telemetry(_loaded.turns)
+        # 本地能力插件（capabilities/*.py）：开关持久化，调用记录进遥测与日志。
+        self.capabilities = None
+        if _config.system.capabilities.enable:
+            self.capabilities = CapabilityManager(_config.system.capabilities.dir,
+                                                  _config.system.capabilities.state_path)
+
         # 提示词分层装配：当前时间 + 人设(L1) + 固定长远计划&目标&待办(L2a) + 长期记忆(L2b)
         #                + 会话摘要(L3b) + 当前状态(L3a) + 自我管理工具说明。
         self.prompt_composer = PromptComposer([
@@ -149,8 +179,85 @@ class ZerolanLiveRobot(BaseBot):
         ])
 
         self.init()
+        self._register_control_handlers()
         self._publish_memory_snapshot()  # 面板初始就有目标/待办/已注入历史可看
+        if self._bc_cfg.enable and self._bc_cfg.prewarm_on_start:
+            # 后台预热垫话音频（不阻塞启动；TTS 服务还没起来也只记一条警告，不影响主流程）。
+            KillableThread(target=self._prewarm_backchannel, daemon=True,
+                           name="BackchannelPrewarm").start()
         logger.info("🤖 Zerolan Live Robot: Initialized services successfully.")
+
+    def _backfill_telemetry(self, turns) -> None:
+        """把启动时载入的历史对话补录进遥测库，让第一次上线就有句子可以打分。"""
+        try:
+            if telemetry.count_turns() > 0:
+                return
+            pairs = []
+            pending_user = None
+            for t in turns or []:
+                role = getattr(t.role, "value", t.role)
+                role = str(role) if role is not None else ""
+                if role == "user":
+                    pending_user = t
+                elif role == "assistant" and pending_user is not None:
+                    md = str(getattr(pending_user, "metadata", "") or "")
+                    # 历史里的时间戳是 "06-12 周五 17:09" 这种没有年份的格式，不能直接参与
+                    # "最近 N 天" 的 SQL 比较；无法归一化时就让遥测库用当前时间。
+                    ts = md if re.match(r"^\d{4}-\d{2}-\d{2}", md) else None
+                    pairs.append((pending_user.content, t.content, ts))
+                    pending_user = None
+            telemetry.backfill_turns(pairs)
+        except Exception as e:
+            logger.warning(f"Telemetry backfill skipped: {e}")
+
+    # ------------------------------------------------------------------
+    # 每日只读日报
+    # ------------------------------------------------------------------
+    def _journal_loop(self) -> None:
+        while self._timer_flag:
+            try:
+                self._maybe_write_journal()
+            except Exception as e:
+                logger.exception(e)
+            time.sleep(60)
+
+    def _maybe_write_journal(self) -> None:
+        cfg = self._sr_cfg
+        if not cfg.enable:
+            return
+        now = datetime.now()
+        if now.hour < int(cfg.journal_hour):
+            return
+        day = now.strftime("%Y-%m-%d")
+        if telemetry.get_journal(day) is not None:
+            return
+        self._write_journal(day)
+
+    def _write_journal(self, day: str) -> Path:
+        stats = telemetry.day_stats(day)
+        reviews = [r for r in telemetry.list_reviews(200) if str(r.get("ts") or "").startswith(day)]
+        reflection = self._journal_reflection(day, stats, reviews)
+        text = journal.render_markdown(day, stats, reviews, reflection)
+        path = Path(self._sr_cfg.journal_dir) / f"{day}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        tokens = stats.get("tokens") or {}
+        telemetry.save_journal(day, str(path),
+                              f"turns={stats.get('turns')} tokens={tokens.get('total_tokens')} "
+                              f"reviews={stats.get('reviews')}")
+        logger.info(f"[JOURNAL] {day} -> {path}")
+        return path
+
+    def _journal_reflection(self, day: str, stats: dict, reviews: list) -> str | None:
+        if self.llm is None:
+            return None
+        try:
+            prompt = journal.build_reflection_prompt(day, stats, reviews)
+            pred = self.llm.predict(LLMQuery(text=prompt, history=[]), source="journal")
+            return pred.response if pred else None
+        except Exception as e:
+            logger.warning(f"Journal reflection failed: {e}")
+            return None
 
     async def start(self):
         logger.info("🤖 Zerolan Live Robot: Running...")
@@ -190,6 +297,11 @@ class ZerolanLiveRobot(BaseBot):
             if self.keyboard is not None:
                 keyboard_thread = KillableThread(target=self.keyboard.start, daemon=True, name="KeyboardThread")
                 threads.append(keyboard_thread)
+
+            if self._sr_cfg.enable and self._sr_cfg.journal_hour <= 24:
+                # 每日只读日报：到点后生成一次，已生成则跳过。
+                journal_thread = KillableThread(target=self._journal_loop, daemon=True, name="JournalLoop")
+                threads.append(journal_thread)
 
             speaker_thread = KillableThread(target=self.speaker.start, daemon=True, name="SpeakerThread")
             threads.append(speaker_thread)
@@ -423,7 +535,8 @@ class ZerolanLiveRobot(BaseBot):
             text = f"你收到了一条弹幕，用户“{event.danmaku.username}”说：\n{event.danmaku.content}"
             if self.enable_turn_taking:
                 # 弹幕也走轮次锁：AI 忙时缓存到下一轮，避免和语音回复互相打架。
-                self._dispatch_user_utterance(text)
+                # 弹幕是文字输入，不垫"嗯？"（垫话只用于语音对话）。
+                self._dispatch_user_utterance(text, is_voice=False)
             else:
                 self.emit_llm_prediction(text)
 
@@ -948,23 +1061,318 @@ class ZerolanLiveRobot(BaseBot):
         new_history.append(pending)
         return 1
 
-    def _try_switch_mode_by_voice(self, text: str) -> bool:
-        """语音模式命令拦截。命中则切换模式并返回 True（该句不再送 LLM）。"""
-        if self.brain is None or not _config.system.brain.enable_voice_mode_command:
+    def _try_local_command(self, text: str) -> bool:
+        """本地命令拦截：模式切换 / 待办 / 目标。
+
+        命中返回 True（该句不再送 LLM），未命中返回 False（正常对话）。
+        短语与句式见 `framework/local_commands.py`；同样的动作也能从 Brain 面板 / HTTP 触发。
+        """
+        cmd = parse_local_command(text)
+        if cmd is None:
             return False
-        t = text.strip()
-        mapping = {
-            "专注模式": "focus", "进入专注模式": "focus", "安静一点": "focus", "安静一会儿": "focus",
-            "普通模式": "normal", "正常模式": "normal",
-            "陪我聊天": "companion", "陪聊模式": "companion", "陪伴模式": "companion", "活跃一点": "companion",
-            "自动模式": "auto", "你自己看着办": "auto",
-        }
-        target = mapping.get(t)
-        if target is None:
-            return False
-        self.brain.set_mode(target)
-        self._announce_mode(target)
+        action, arg = cmd
+        try:
+            if action == "mode.set":
+                if self.brain is None or not _config.system.brain.enable_voice_mode_command:
+                    return False
+                self.brain.set_mode(arg)
+                self._announce_mode(arg)
+            elif action == "mode.resume":
+                if self.brain is None:
+                    return False
+                if self.brain.mode == "focus":
+                    new_mode = self.brain.toggle_quiet()
+                else:
+                    self.brain.set_mode("auto")
+                    new_mode = "auto"
+                self._announce_mode(new_mode)
+            elif action.startswith(("todo.", "goal.")):
+                changed = self._apply_state_command(action, arg)
+                if changed and self.tts_prompt_manager is not None:
+                    self._tts_without_block(self.tts_prompt_manager.default_tts_prompt,
+                                            "记下了。" if action.endswith(".add") else "好。")
+            else:
+                return False
+        except Exception as e:
+            logger.exception(e)
         return True
+
+    def _apply_state_command(self, action: str, item: str) -> bool:
+        """对待办 / 目标执行增、删、完成，落盘并刷新面板。返回是否真的改了。"""
+        update_key = {
+            "todo.add": "add_todo",
+            "todo.done": "done_todo",
+            "todo.undone": "undone_todo",
+            "todo.remove": "remove_todo",
+            "goal.add": "add_goal",
+            "goal.remove": "remove_goal",
+        }.get(action)
+        if update_key is None:
+            raise ValueError(f"unknown state action: {action}")
+        changed = self.self_state.apply_update({update_key: item})
+        if changed:
+            logger.info(f"SelfState updated via {action}: {item}")
+        self._publish_memory_snapshot()
+        return changed
+
+    # ------------------------------------------------------------------
+    # 本地控制面：供 Brain 面板 / HTTP / 外部脚本调用（见 framework/control.py）
+    # ------------------------------------------------------------------
+    def _register_control_handlers(self) -> None:
+        control.register("state", self._ctl_state)
+        control.register("mode.set", self._ctl_set_mode)
+        control.register("mode.resume", self._ctl_resume_mode)
+        control.register("mic.set", self._ctl_set_mic)
+        control.register("speak", self._ctl_speak)
+        control.register("ask", self._ctl_ask)
+        control.register("stop", self._ctl_stop)
+        for name in ("todo.add", "todo.done", "todo.undone", "todo.remove",
+                     "goal.add", "goal.remove"):
+            control.register(name, lambda p, _n=name: self._ctl_state_command(_n, p))
+        # 回顾 / 打分 / 修改意见 / 日报 / token
+        control.register("review.sample", self._ctl_review_sample)
+        control.register("review.submit", self._ctl_review_submit)
+        control.register("review.list", self._ctl_review_list)
+        control.register("review.generate_proposals", self._ctl_generate_proposals)
+        control.register("proposal.list", self._ctl_proposals)
+        control.register("proposal.decide", self._ctl_decide_proposal)
+        control.register("journal.list", self._ctl_journal_list)
+        control.register("journal.get", self._ctl_journal_get)
+        control.register("journal.write", self._ctl_write_journal)
+        control.register("tokens.stats", self._ctl_tokens)
+        # 本地能力
+        control.register("capability.list", self._ctl_cap_list)
+        control.register("capability.toggle", self._ctl_cap_toggle)
+        control.register("capability.run", self._ctl_cap_run)
+        control.register("capability.runs", self._ctl_cap_runs)
+        logger.info(f"Control plane ready: {control.available()}")
+
+    def _ctl_state(self, _payload=None) -> dict:
+        return {
+            "bot_name": self.bot_name,
+            "mode": self.brain.mode if self.brain else None,
+            "effective_mode": self.brain.effective_mode if self.brain else None,
+            "mic_on": bool(self.mic is not None and self.mic.is_set_talk_enabled_event()),
+            "busy": self.conv_state.is_ai_busy(),
+            "goals": list(self.self_state.goals),
+            "todolist": [dict(t) for t in self.self_state.todolist],
+        }
+
+    def _ctl_set_mode(self, payload) -> dict:
+        if self.brain is None:
+            raise RuntimeError("brain is disabled (system.brain.enable=false)")
+        mode = str(payload.get("mode", "")).strip()
+        if not self.brain.set_mode(mode):
+            raise ValueError(f"unknown mode: {mode!r} (auto|focus|normal|companion)")
+        if payload.get("announce"):
+            self._announce_mode(mode)
+        return {"mode": mode}
+
+    def _ctl_resume_mode(self, _payload) -> dict:
+        if self.brain is None:
+            raise RuntimeError("brain is disabled")
+        if self.brain.mode == "focus":
+            mode = self.brain.toggle_quiet()
+        else:
+            self.brain.set_mode("auto")
+            mode = "auto"
+        return {"mode": mode}
+
+    def _ctl_set_mic(self, payload) -> dict:
+        if self.mic is None:
+            raise RuntimeError("microphone is not available")
+        if bool(payload.get("on", True)):
+            self.mic.resume()
+        else:
+            self.mic.pause()
+        return {"mic_on": bool(self.mic.is_set_talk_enabled_event())}
+
+    def _ctl_speak(self, payload) -> dict:
+        text = self._need_text(payload)
+        if self.tts is None or self.tts_prompt_manager is None:
+            raise RuntimeError("tts is disabled")
+        self._tts_without_block(self.tts_prompt_manager.default_tts_prompt, text)
+        return {"spoken": text}
+
+    def _ctl_ask(self, payload) -> dict:
+        """把一段文字当作"用户说的话"喂给机器人，走完整的一轮 LLM 回复。"""
+        text = self._need_text(payload)
+        threading.Thread(target=lambda: self._dispatch_user_utterance(text, is_voice=False),
+                         daemon=True, name="ControlAsk").start()
+        return {"accepted": True, "text": text}
+
+    def _ctl_stop(self, _payload) -> dict:
+        """立即停止说话并取消在途生成（和插话打断同一条路径）。"""
+        self._cancel_event.set()
+        try:
+            self.speaker.stop_now()
+        except Exception as e:
+            logger.debug(f"Speaker stop failed: {e}")
+        try:
+            while not self.subtitles_queue.empty():
+                self.subtitles_queue.get_nowait()
+        except Exception:
+            pass
+        self.conv_state.reset_tts()
+        self.conv_state.end_thinking()
+        return {"stopped": True}
+
+    def _ctl_state_command(self, action: str, payload) -> dict:
+        item = self._need_text(payload)
+        changed = self._apply_state_command(action, item)
+        return {"changed": changed,
+                "goals": list(self.self_state.goals),
+                "todolist": [dict(t) for t in self.self_state.todolist]}
+
+    @staticmethod
+    def _need_text(payload) -> str:
+        text = str((payload or {}).get("text", "")).strip()
+        if not text:
+            raise ValueError("`text` is required")
+        return text
+
+    # ------------------------------------------------------------------
+    # 回顾 / 打分 / 修改意见 / 日报 / token
+    # ------------------------------------------------------------------
+    def _ctl_review_sample(self, payload) -> dict:
+        n = int(payload.get("n") or self._sr_cfg.review_sample_size)
+        days = int(payload.get("days") or self._sr_cfg.review_sample_days)
+        turns = telemetry.sample_unreviewed_turns(n, days)
+        reviewed = len(telemetry.reviewed_turn_ids())
+        return {"turns": turns, "remaining": max(0, telemetry.count_turns() - reviewed)}
+
+    def _ctl_review_submit(self, payload) -> dict:
+        turn_id = int(payload.get("turn_id"))
+        score = int(payload.get("score"))
+        telemetry.save_review(turn_id, score, str(payload.get("tags") or ""),
+                              str(payload.get("comment") or ""))
+        logger.info(f"[REVIEW] turn={turn_id} score={score}")
+        return {"stats": telemetry.review_stats()}
+
+    def _ctl_review_list(self, payload) -> dict:
+        return {"reviews": telemetry.list_reviews(int(payload.get("limit") or 50))}
+
+    def _ctl_tokens(self, payload) -> dict:
+        day = str(payload.get("day") or datetime.now().strftime("%Y-%m-%d"))
+        return {"day": day,
+                "tokens": telemetry.token_totals(day),
+                "all_time": telemetry.token_totals(),
+                "stats": telemetry.day_stats(day),
+                "review_stats": telemetry.review_stats(day)}
+
+    def _ctl_generate_proposals(self, payload) -> dict:
+        reviews = telemetry.list_reviews(20)
+        if not reviews:
+            raise ValueError("还没有评分，先抽几句打分再生成建议")
+        limit = int(payload.get("limit") or self._sr_cfg.proposal_max_items)
+        items = self._propose_revisions(reviews, limit)
+        for item in items:
+            telemetry.add_proposal(item["title"], item["body"])
+        logger.info(f"[REVIEW] generated {len(items)} proposal(s)")
+        return {"created": len(items), "proposals": telemetry.list_proposals("pending")}
+
+    def _propose_revisions(self, reviews: list, limit: int) -> list[dict]:
+        if self.llm is None:
+            raise RuntimeError("llm is unavailable")
+        brief = []
+        for r in reviews[:15]:
+            brief.append(
+                f"- {r.get('score')}分｜标签:{r.get('tags') or '无'}｜备注:{r.get('comment') or '无'}｜"
+                f"用户:{str(r.get('user_text') or '')[:60]}｜她:{str(r.get('reply') or '')[:80]}")
+        prompt = ("你在帮一个 AI 主播根据用户打分改进表达方式。下面是最近的评分记录：\n"
+                  + "\n".join(brief)
+                  + f"\n\n请给出最多 {limit} 条可执行的中文调整建议。"
+                    "只输出 JSON 数组，不要解释、不要代码块。格式："
+                    '[{"title":"短标题","body":"一条具体、可执行、针对表达方式的约定（40~80字）"}]')
+        pred = self.llm.predict(LLMQuery(text=prompt, history=[]), source="review")
+        return self._parse_proposals((pred.response if pred else "") or "", limit)
+
+    @staticmethod
+    def _parse_proposals(text: str, limit: int) -> list[dict]:
+        s = (text or "").strip()
+        if "```" in s:
+            s = re.sub(r"```(?:json)?", "", s).strip("` \n")
+        items: list[dict] = []
+        start, end = s.find("["), s.rfind("]")
+        if start >= 0 and end > start:
+            try:
+                for it in json.loads(s[start:end + 1]):
+                    if isinstance(it, dict):
+                        body = str(it.get("body") or "").strip()
+                        if body:
+                            items.append({"title": (str(it.get("title") or "").strip() or "调整建议")[:40],
+                                          "body": body[:200]})
+            except Exception:
+                items = []
+        if not items and s:
+            items = [{"title": "调整建议", "body": s[:200]}]
+        return items[:max(1, limit)]
+
+    def _ctl_proposals(self, payload) -> dict:
+        return {"proposals": telemetry.list_proposals(payload.get("status") or None)}
+
+    def _ctl_decide_proposal(self, payload) -> dict:
+        pid = int(payload.get("id"))
+        approve = bool(payload.get("approve"))
+        proposal = telemetry.decide_proposal(pid, approve)
+        if proposal is None:
+            raise KeyError(f"no proposal {pid}")
+        applied = False
+        if approve:
+            applied = self.self_state.add_adjustment(proposal["body"])
+            self._publish_memory_snapshot()
+        logger.info(f"[REVIEW] proposal {pid} {'accepted' if approve else 'rejected'} applied={applied}")
+        return {"proposal": proposal, "applied": applied}
+
+    def _ctl_journal_list(self, payload) -> dict:
+        return {"journals": telemetry.list_journals(int(payload.get("limit") or 14))}
+
+    def _ctl_journal_get(self, payload) -> dict:
+        day = str(payload.get("day") or datetime.now().strftime("%Y-%m-%d"))
+        row = telemetry.get_journal(day)
+        if row is None:
+            raise KeyError(f"no journal for {day}")
+        path = Path(row["path"])
+        md = path.read_text(encoding="utf-8") if path.exists() else ""
+        return {"day": day, "markdown": md, "path": str(path)}
+
+    def _ctl_write_journal(self, payload) -> dict:
+        day = str(payload.get("day") or datetime.now().strftime("%Y-%m-%d"))
+        path = self._write_journal(day)
+        return {"day": day, "path": str(path)}
+
+    # ------------------------------------------------------------------
+    # 本地能力
+    # ------------------------------------------------------------------
+    def _ctl_cap_list(self, _payload) -> dict:
+        if self.capabilities is None:
+            return {"enabled": False, "capabilities": [], "runs": []}
+        return {"enabled": True,
+                "capabilities": self.capabilities.list_info(),
+                "runs": telemetry.recent_capability_runs(10)}
+
+    def _ctl_cap_toggle(self, payload) -> dict:
+        if self.capabilities is None:
+            raise RuntimeError("capabilities are disabled in config")
+        name = str(payload.get("name") or "")
+        return {"name": name,
+                "enabled": self.capabilities.set_enabled(name, bool(payload.get("enabled", True)))}
+
+    def _ctl_cap_run(self, payload) -> dict:
+        if self.capabilities is None:
+            raise RuntimeError("capabilities are disabled in config")
+        name = str(payload.get("name") or "")
+        args = payload.get("args") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except Exception:
+                raise ValueError("args must be a JSON object")
+        return self.capabilities.run(name, args)
+
+    def _ctl_cap_runs(self, payload) -> dict:
+        return {"runs": telemetry.recent_capability_runs(
+            int(payload.get("limit") or 20), payload.get("name") or None)}
 
     def _announce_mode(self, mode: str) -> None:
         if not _config.system.brain.announce_mode_switch:
@@ -1010,14 +1418,174 @@ class ZerolanLiveRobot(BaseBot):
         self.conv_state.reset_tts()
         self.conv_state.end_thinking()
 
-    def _dispatch_user_utterance(self, text: str) -> None:
+    # ------------------------------------------------------------------
+    # 垫话（backchannel）：用户这句话刚识别出来、LLM 还没开口时先垫一个极短的"嗯？"
+    # ------------------------------------------------------------------
+    def _backchannel_fingerprint(self) -> str:
+        """缓存指纹：参考音频 / 转写文本 / 语言 / TTS 模型任一变化都要重新合成。"""
+        prompt = self.tts_prompt_manager.default_tts_prompt if self.tts_prompt_manager else None
+        parts = [
+            getattr(prompt, "audio_path", "") or "",
+            getattr(prompt, "prompt_text", "") or "",
+            getattr(prompt, "lang", "") or "",
+            _config.pipeline.tts.model_id or "",
+        ]
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+    def _backchannel_path(self, phrase: str) -> Path:
+        name = hashlib.sha1(phrase.encode("utf-8")).hexdigest()[:8]
+        return Path(self._bc_cfg.cache_dir) / f"{self._backchannel_fingerprint()}_{name}.wav"
+
+    def _synthesize_backchannel(self, phrase: str) -> Path | None:
+        prompt = self.tts_prompt_manager.default_tts_prompt if self.tts_prompt_manager else None
+        if self.tts is None or prompt is None:
+            return None
+        query = TTSQuery(text=phrase, text_language="auto", refer_wav_path=prompt.audio_path,
+                         prompt_text=prompt.prompt_text, prompt_language=prompt.lang, audio_type="wav")
+        prediction = self.tts.predict(query=query)
+        if prediction is None or not prediction.wave_data:
+            return None
+        path = self._backchannel_path(phrase)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")  # 先写临时名再原子替换，避免别的线程读到半个文件
+        tmp.write_bytes(prediction.wave_data)
+        tmp.replace(path)
+        return path
+
+    def _backchannel_script(self) -> "bc.Script":
+        """按文件修改时间热加载垫话 JSON；文件不存在时自动生成一份默认的。"""
+        path = Path(self._bc_cfg.json_path or "resources/backchannel.json")
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime is None:
+            bc.ensure_file(path)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = None
+        if self._bc_script is not None and mtime == self._bc_script_mtime:
+            return self._bc_script
+        script = bc.load_script(path) if path.exists() else self._default_backchannel_script()
+        if self._bc_script is not None:
+            logger.info(f"Backchannel script reloaded: {len(script.phrases)} phrase(s), source={script.source}")
+        self._bc_script = script
+        self._bc_script_mtime = mtime
+        self._bc_recent = deque(maxlen=max(1, script.avoid_repeat_window))
+        return script
+
+    def _default_backchannel_script(self) -> "bc.Script":
+        """JSON 不可用时的兜底：优先用 config 里的 phrases（老配置），否则用内置默认。"""
+        phrases = [p.strip() for p in (self._bc_cfg.phrases or []) if (p or "").strip()]
+        if phrases:
+            return bc.parse_script({"phrases": phrases}, source="config.yaml")
+        return bc.default_script()
+
+    def _prewarm_backchannel(self) -> None:
+        """把脚本里还没缓存的垫话按当前音色依次合成好（运行在自己的线程里）。"""
+        try:
+            script = self._backchannel_script()
+        except Exception as e:
+            logger.warning(f"Backchannel script unavailable: {e}")
+            return
+        for phrase in script.phrases:
+            try:
+                path = self._backchannel_path(phrase.text)
+                if path.exists() and path.stat().st_size > 0:
+                    continue
+                if self._synthesize_backchannel(phrase.text) is not None:
+                    logger.info(f"Backchannel ready: {phrase.text!r} -> {path}")
+            except Exception as e:
+                logger.warning(f"Backchannel prewarm failed for {phrase.text!r}: {e}")
+
+    def _pick_backchannel(self, text: str = "") -> tuple[str, Path] | None:
+        """按"问句/陈述"选语气，避开最近用过的，按权重随机；只选已经合成好的句子。"""
+        script = self._backchannel_script()
+        ready: list[tuple["bc.Phrase", Path]] = []
+        for phrase in script.phrases:
+            path = self._backchannel_path(phrase.text)
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    ready.append((phrase, path))
+            except OSError:
+                continue
+        if not ready:
+            # 还没预热好：后台补合成，这次不垫——宁可不垫，也不在关键时刻多等一次合成。
+            self._kick_backchannel_synthesis()
+            return None
+        # 脚本刚热加载过、或有新增句子还没合成：顺手在后台补齐，别让它们永远缺席。
+        ready_texts = {p.text for p, _ in ready}
+        if any(p.text not in ready_texts for p in script.phrases):
+            self._kick_backchannel_synthesis()
+        ready_script = bc.Script(phrases=[p for p, _ in ready],
+                                 avoid_repeat_window=script.avoid_repeat_window,
+                                 source=script.source)
+        tag = bc.TAG_QUESTION if bc.looks_like_question(text) else bc.TAG_STATEMENT
+        chosen = bc.choose_phrase(ready_script, tag, recent=list(self._bc_recent))
+        if chosen is None:
+            return None
+        path_by_text = {p.text: path for p, path in ready}
+        return chosen.text, path_by_text[chosen.text]
+
+    def _kick_backchannel_synthesis(self) -> None:
+        if self._bc_synth_running:
+            return
+        self._bc_synth_running = True
+
+        def work():
+            try:
+                self._prewarm_backchannel()
+            finally:
+                self._bc_synth_running = False
+
+        KillableThread(target=work, daemon=True, name="BackchannelSynth").start()
+
+    def _maybe_backchannel(self, is_voice: bool = True, text: str = "") -> None:
+        """用户这句话刚出 ASR 结果、LLM 还没开口时，先垫一小句。
+
+        说什么由 `resources/backchannel.json` 决定（可按问句/陈述分类、带权重、避开最近用过的）。
+        只在"AI 空闲、这一轮马上要开始"时调用（调用点已经通过轮次锁占据了本轮），
+        因此不会与正在播放的回复叠在一起。播放走 `play_tts`，所以字幕 / Live2D 口型 /
+        回声抑制与正常回复完全一致，只是不进对话历史、不占轮次。
+        """
+        if not is_voice or not self._bc_cfg.enable:
+            return
+        if self.tts is None or self.tts_prompt_manager is None:
+            return
+        if self.tts_prompt_manager.default_tts_prompt is None:
+            return
+        if self.playground is not None and getattr(self.playground, "is_connected", False):
+            # 远程展示器在播时本地扬声器不出声，垫话听不到，跳过。
+            return
+        now = time.monotonic()
+        if now - self._bc_last_play < float(self._bc_cfg.min_interval_s or 0.0):
+            return
+        picked = self._pick_backchannel(text)
+        if picked is None:
+            return
+        phrase, path = picked
+        self._bc_last_play = now
+        self._bc_recent.append(phrase)
+        try:
+            prediction = TTSPrediction(wave_data=path.read_bytes(), audio_type="wav")
+            self.play_tts(PipelineOutputTTSEvent(prediction=prediction, transcript=phrase))
+            logger.debug(f"Backchannel: {phrase!r}")
+        except Exception as e:
+            logger.warning(f"Backchannel playback failed: {e}")
+
+    def _dispatch_user_utterance(self, text: str, is_voice: bool = True) -> None:
         """轮次锁入口：决定"现在这句话能不能马上回复"。
 
         - AI 正忙（思考中 / 还有 TTS 在播）：把这句话缓存进 pending，等当前一轮说完后由
           `_turn_dispatch_loop` 合并补发，绝不并发开第二个 LLM。
         - AI 空闲：原子地占据本轮（begin_thinking），然后真正调用 LLM。
+
+        `is_voice=True`（语音输入）时，在真正开始这一轮之前先垫一个极短的"嗯？"，
+        盖住 LLM 首句生成前的空档；弹幕等文本输入不垫。
         """
         if not self.enable_turn_taking:
+            self._maybe_backchannel(is_voice, text)
             self.emit_llm_prediction(text)
             return
 
@@ -1025,8 +1593,8 @@ class ZerolanLiveRobot(BaseBot):
         if not text:
             return
 
-        # 语音模式命令拦截（"专注模式""陪我聊天"等），命中则不送 LLM。
-        if self._try_switch_mode_by_voice(text):
+        # 本地命令拦截（模式切换 / 待办 / 目标），命中则不送 LLM。
+        if self._try_local_command(text):
             return
 
         with self._turn_lock:
@@ -1042,6 +1610,8 @@ class ZerolanLiveRobot(BaseBot):
             # 占据本轮：在锁内置 thinking，确保并发到来的其它输入会看到"忙"。
             self.conv_state.begin_thinking()
 
+        # 本轮已经占住、LLM 还没开口——这正是垫话的时机（在 _run_turn 之前入扬声器队列）。
+        self._maybe_backchannel(is_voice, text)
         self._run_turn(text)
 
     def _run_turn(self, text: str) -> None:
@@ -1082,6 +1652,8 @@ class ZerolanLiveRobot(BaseBot):
 
     def emit_llm_prediction(self, text, direct_return: bool = False) -> None | LLMPrediction:
         logger.debug("`emit_llm_prediction` called")
+        t0 = time.monotonic()
+        token_mark = telemetry.last_llm_id()
         # 新一轮开始：清除上一轮可能残留的打断取消令牌。
         if not direct_return:
             self._cancel_event.clear()
@@ -1140,6 +1712,13 @@ class ZerolanLiveRobot(BaseBot):
 
         if committed:
             self._on_turn_committed(2 + extra)  # (主动发言?) + user + assistant
+        if committed and not direct_return:
+            # 记录这一轮（供随机抽样打分 / 之后做微调数据集），并带上本轮实际 token 用量。
+            p_tok, c_tok = telemetry.sum_tokens_since(token_mark, source="chat")
+            telemetry.record_turn(text, prediction.response,
+                                  int((time.monotonic() - t0) * 1000),
+                                  self._cancel_event.is_set(), p_tok, c_tok,
+                                  meta={"route": "blocking"})
         self._publish_memory_snapshot()
         self._persist_memory()
 
@@ -1242,6 +1821,8 @@ class ZerolanLiveRobot(BaseBot):
         """
         # 新一轮开始：清除上一轮可能残留的打断取消令牌。
         self._cancel_event.clear()
+        t0 = time.monotonic()
+        token_mark = telemetry.last_llm_id()
         self._current_user_text = text
         query = LLMQuery(text=text, history=self._history_for_query())
         logger.info(f"LLM send: {query}")
@@ -1336,6 +1917,11 @@ class ZerolanLiveRobot(BaseBot):
 
         if committed:
             self._on_turn_committed(2 + extra)
+            p_tok, c_tok = telemetry.sum_tokens_since(token_mark, source="chat")
+            telemetry.record_turn(text, full_response,
+                                  int((time.monotonic() - t0) * 1000),
+                                  self._cancel_event.is_set(), p_tok, c_tok,
+                                  meta={"route": "stream"})
         self._publish_memory_snapshot()
         self._persist_memory()
 

@@ -31,6 +31,11 @@ Zerolan Live Robot 是一款多功能的直播机器人（AI VTuber），它可�
 - [x] ⌨️ 键盘热键控制机器人的麦克风开关
 - [x] 🐧 QQ 机器人的文字、语音和图像多模态回复
 
+> 🔊 监听层的抗噪设计（键盘 / 咳嗽 / 环境噪声的误触发、插话打断误触、各项阈值的含义与调法）见 [docs/noise-robustness.md](docs/noise-robustness.md)。
+> 💬 她开口前的"垫话"（嗯？/ 在呢 / 怎么啦）可在 [resources/backchannel.json](resources/backchannel.json) 里配置，说明见 [docs/backchannel.md](docs/backchannel.md)。
+> 🎛️ 控制台与本地 API（切模式 / 开关麦 / 待办 / 给她发消息）见 [docs/control-console.md](docs/control-console.md)。
+> 📊 回顾、打分、日报与 token 记账见 [docs/self-review.md](docs/self-review.md)；本地能力插件见 [docs/capabilities.md](docs/capabilities.md)。
+
 ## 安装并运行
 
 Zerolan Project 由 [ZerolanLiveRobot](https://github.com/AkagawaTsurunaki/ZerolanLiveRobot)、[ZerolanCore](https://github.com/AkagawaTsurunaki/zerolan-core)、[ZerolanData](https://github.com/AkagawaTsurunaki/zerolan-data)、[ZerolanPlayground](https://github.com/AkagawaTsurunaki/ZerolanPlayground)、[KonekoMinecraftBot](https://github.com/AkagawaTsurunaki/KonekoMinecraftBot) 等项目共同组成。下表简要地介绍了各个项目的用途，您可以根据需要使用：

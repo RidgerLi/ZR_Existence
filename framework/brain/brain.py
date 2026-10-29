@@ -168,6 +168,11 @@ class Brain:
     def mode(self) -> str:
         return self._mode
 
+    @property
+    def effective_mode(self) -> str:
+        """当前实际生效的档位（auto 模式下由感知自动选择）。供面板 / 控制面读取。"""
+        return self._effective_mode
+
     def state_prompt(self) -> str:
         """供 bot 拼进 LLM 请求的"内部状态"system 片段（瞬态，不入历史）。"""
         return build_state_prompt(self.drives.state, self._effective_mode)

@@ -2,6 +2,7 @@ import io
 import threading
 import time
 import wave
+from typing import Callable, Optional
 
 import numpy as np
 import pyaudio
@@ -10,6 +11,7 @@ from loguru import logger
 
 from common.concurrent.abs_runnable import ThreadRunnable
 from common.io.file_type import AudioFileType
+from devices.noise_gate import FrameFeatures, NoiseGate
 from event.event_data import DeviceMicrophoneVADEvent
 from event.event_emitter import emitter
 
@@ -20,7 +22,13 @@ class SmartMicrophone(ThreadRunnable):
                  playback_tail_ms: int = 400, energy_ref: float = 3000.0,
                  full_duplex: bool = False, echo_canceller=None,
                  playback_speech_prob: float = 0.7,
-                 enable_barge_in: bool = False, barge_in_min_ms: int = 180):
+                 enable_barge_in: bool = False, barge_in_min_ms: int = 180,
+                 noise_gate: Optional[NoiseGate] = None,
+                 keyboard_probe: Optional[Callable[[], bool]] = None,
+                 trailing_silence_ms: int = 300,
+                 log_utterances: bool = True,
+                 barge_in_gap_ms: int = 350,
+                 barge_in_grace_ms: int = 300):
         """
         初始化智能麦克风类
         :param enable_vad: 是否启用 webrtcvad 进行语音端点检测。开启后讲话间隔超过
@@ -49,6 +57,16 @@ class SmartMicrophone(ThreadRunnable):
                                 上层执行停播+取消生成的硬打断）。
         :param barge_in_min_ms: 触发打断所需的"播放期间连续语音"时长（毫秒）。越大越抗残余回声
                                 误触发但打断越慢，越小打断越快但可能误切。
+        :param noise_gate: `devices.noise_gate.NoiseGate` 实例（或 None）。提供能量门、句级频谱评分与
+                           更严的插话帧判定；None 时退回仅 webrtcvad 的旧行为。
+        :param keyboard_probe: 返回 bool 的探针：最近一段时间内是否发生过击键。为真时该帧直接判为非语音
+                               （键盘声与击键时间高度相关，这是最准的一条抗噪证据）。
+        :param trailing_silence_ms: 句尾保留多少毫秒静音写进 WAV。VAD 仍按完整 hangover 判句尾，
+                                    这里只裁剪发给 ASR 的音频长度，减少长静音导致的 ASR 幻听。
+        :param log_utterances: 是否每句话打印一行 `[VAD] ... -> ACCEPT/REJECT(原因)` 指标日志（调参用）。
+        :param barge_in_gap_ms: 打断证据计数器的静音重置时长。原先沿用 1.2s hangover，导致整段播放里
+                                稀疏的误判帧能一直累加；改短后必须"持续在说话"才能打断。
+        :param barge_in_grace_ms: 每段播放开始后的免计时间，等回声消除器收敛，避免起始瞬态误触发打断。
         """
         super().__init__()
         self._enable_vad = enable_vad
@@ -136,6 +154,21 @@ class SmartMicrophone(ThreadRunnable):
         self._pb_speech_frames = 0
         self._pb_silence_frames = 0
         self._barge_in_fired = False
+        # 打断证据的新口径：短静音（默认 350ms）就清零；播放开始后有一小段免计时等 AEC 收敛。
+        self._barge_gap_frames = max(1, int(barge_in_gap_ms) // frame_duration)
+        self._barge_grace_s = max(0.0, float(barge_in_grace_ms) / 1000.0)
+        self._playback_started_at = 0.0
+
+        # 抗噪门（能量 / 频谱 / 键盘活动）：见 devices/noise_gate.py
+        self._noise = noise_gate
+        self._kb_probe = keyboard_probe
+        self._trailing_silence_frames = max(0, int(trailing_silence_ms) // frame_duration)
+        self._log_utterances = bool(log_utterances)
+        self._last_rms = 0.0
+        # 当前句子的统计：语音帧特征、总帧数、最后一个语音帧的位置（用于算"语音密度"）。
+        self._utterance_feats: list[FrameFeatures] = []
+        self._utterance_frames = 0
+        self._last_speech_frame_at = 0
 
     @property
     def is_recording(self):
@@ -194,6 +227,7 @@ class SmartMicrophone(ThreadRunnable):
         """扬声器开始播放本地音频时调用：立即关闭麦克风采集（半双工）。"""
         with self._playback_lock:
             self._playback_count += 1
+            self._playback_started_at = time.monotonic()
 
     def end_playback(self):
         """扬声器播放完一段本地音频时调用：在尾巴时间过后再恢复采集。"""
@@ -216,6 +250,9 @@ class SmartMicrophone(ThreadRunnable):
             self._pb_silence_frames = 0
             self._barge_in_fired = False
             return
+        if time.monotonic() - self._playback_started_at < self._barge_grace_s:
+            # 播放刚开始的一小段：回声消除器还在收敛，这期间的帧不计入打断证据。
+            return
         if is_speech:
             self._pb_speech_frames += 1
             self._pb_silence_frames = 0
@@ -228,9 +265,10 @@ class SmartMicrophone(ThreadRunnable):
                 except Exception as e:
                     logger.exception(e)
         else:
-            # 短静音（辅音/换气）不清零；只有持续静音超过 hangover 才认为这段插话结束。
+            # 短静音（辅音/换气）不清零；超过 barge_in_gap_ms 就认为这段插话断了，重新计数。
+            # 原先用 1.2s hangover 重置，导致整段播放里稀疏的误判帧能一直累加，最终凑成一次假打断。
             self._pb_silence_frames += 1
-            if self._pb_silence_frames >= self._silence_hangover_frames:
+            if self._pb_silence_frames >= self._barge_gap_frames:
                 self._pb_speech_frames = 0
                 self._pb_silence_frames = 0
 
@@ -247,51 +285,106 @@ class SmartMicrophone(ThreadRunnable):
 
         # 更新能量 EMA（半双工下仅在非抑制帧上；全双工下用的是已消回声的帧）。
         self._update_energy(data)
+        rms = self._last_rms
 
-        if self._enable_vad:
-            is_speech = self._vad.is_speech(data, self._sample_rate)
-
-            # 全双工 + 正在播放：用 AEC 的语音概率再过一道门，拒绝消不干净的残余回声，
-            # 避免机器人把自己的尾音当成用户输入。
-            if is_speech and playback_active and self._full_duplex \
-                    and self._playback_speech_prob > 0.0 and self._aec is not None:
-                if self._aec.last_speech_prob < self._playback_speech_prob:
-                    is_speech = False
-
-            # 插话打断检测：机器人正在播放时，用户连续说话达到阈值即触发硬打断回调。
-            self._detect_barge_in(playback_active, is_speech)
-
-            if is_speech:
-                if not self._is_speaking:
-                    logger.info("Voice detected: Beginning.")
-                    self._is_speaking = True
-                    self._speech_frame_count = 0
-                self._audio_frames.append(data)
-                self._speech_frame_count += 1
-                self._silence_frame_count = 0
-            else:
-                if self._is_speaking:
-                    # 已经在讲话中：把静音帧也保留进来当作 hangover
-                    self._audio_frames.append(data)
-                    self._silence_frame_count += 1
-                    if self._silence_frame_count >= self._silence_hangover_frames:
-                        logger.info(
-                            f"Voice detected: Ending. (speech={self._speech_frame_count} frames, "
-                            f"silence_hangover={self._silence_frame_count} frames)"
-                        )
-                        if self._speech_frame_count >= self._min_speech_frames:
-                            self._emit_event()
-                        else:
-                            logger.debug(
-                                f"Speech too short ({self._speech_frame_count} frames < "
-                                f"{self._min_speech_frames}), drop."
-                            )
-                        self._reset_vad_state()
-                # 还没开始讲话：直接丢掉静音帧
-        else:
+        if not self._enable_vad:
             if not self._is_speaking:
                 self._is_speaking = True
             self._audio_frames.append(data)
+            return
+
+        is_speech = self._vad.is_speech(data, self._sample_rate)
+
+        # 全双工 + 正在播放：用 AEC 的语音概率再过一道门，拒绝消不干净的残余回声，
+        # 避免机器人把自己的尾音当成用户输入。
+        aec_prob = getattr(self._aec, "last_speech_prob", None) if self._full_duplex and self._aec else None
+        if is_speech and playback_active and self._full_duplex \
+                and self._playback_speech_prob > 0.0 and aec_prob is not None:
+            if aec_prob < self._playback_speech_prob:
+                is_speech = False
+
+        # 抗噪门 A：键盘活动。最近有击键 → 这帧不可能是"用户在说话"。
+        # 键盘声与击键时间高度相关，这是最准、最便宜的一条证据。
+        if is_speech and self._kb_probe is not None:
+            try:
+                if self._kb_probe():
+                    is_speech = False
+            except Exception as e:
+                logger.debug(f"Keyboard probe failed: {e}")
+
+        # 抗噪门 B：能量。低于绝对静音门、或没比自适应底噪高出足够倍数 → 不是语音。
+        # 特征每帧最多算一次；不需要频谱时 NoiseGate.features 只算 RMS。
+        feats: FrameFeatures | None = None
+        if self._noise is not None:
+            if is_speech:
+                feats = self._noise.features(data)
+                if not self._noise.energy_ok(feats.rms):
+                    is_speech = False
+            elif not playback_active and not self._is_speaking:
+                # 只在"VAD 判非语音 + 不在播放 + 不在句子中"时学习底噪，
+                # 否则会把用户自己的声音学成底噪，门限越抬越高。
+                self._noise.observe_noise(rms)
+
+        # 插话打断：只有"确凿的人声帧"才计数（键盘/咳嗽/宽带噪声在这里被挡掉）。
+        clean_for_barge_in = is_speech
+        if is_speech and playback_active and self._noise is not None:
+            feats = feats if feats is not None else self._noise.features(data)
+            clean_for_barge_in = self._noise.barge_in_frame_ok(feats, speech_prob=aec_prob)
+        self._detect_barge_in(playback_active, clean_for_barge_in)
+
+        if is_speech:
+            if not self._is_speaking:
+                logger.info("Voice detected: Beginning.")
+                self._is_speaking = True
+                self._speech_frame_count = 0
+            self._audio_frames.append(data)
+            self._speech_frame_count += 1
+            self._silence_frame_count = 0
+            # 句子密度统计：记录语音帧数与最后一个语音帧的位置。
+            self._utterance_frames += 1
+            self._last_speech_frame_at = self._utterance_frames
+            if self._noise is not None:
+                self._utterance_feats.append(feats if feats is not None else self._noise.features(data))
+        else:
+            if self._is_speaking:
+                self._utterance_frames += 1
+                # 句尾静音只保留前 trailing_silence_ms：VAD 仍按完整 hangover 判句尾，
+                # 但发给 ASR 的 WAV 不再拖着整整 1.2 秒静音（那是幻觉文本的常见来源）。
+                if self._silence_frame_count < self._trailing_silence_frames:
+                    self._audio_frames.append(data)
+                self._silence_frame_count += 1
+                if self._silence_frame_count >= self._silence_hangover_frames:
+                    self._finish_utterance()
+            # 还没开始讲话：直接丢掉静音帧
+
+    def _finish_utterance(self):
+        """一句话结束：先过最短时长与抗噪门，通过才发 ASR。"""
+        n_speech = self._speech_frame_count
+        logger.info(
+            f"Voice detected: Ending. (speech={n_speech} frames, "
+            f"silence_hangover={self._silence_frame_count} frames)"
+        )
+
+        accept, reason, stats = True, "ok", None
+        if self._noise is not None:
+            span = max(self._last_speech_frame_at, n_speech)
+            accept, reason, stats = self._noise.score(self._utterance_feats, span)
+        if n_speech < self._min_speech_frames:
+            # 时长不够：即使频谱像人声也丢（阈值 = vad_min_speech_ms）。
+            # 仍然算指标并打印，方便看清"到底差多少帧"。
+            accept, reason = False, "too_short"
+
+        if self._log_utterances:
+            if stats is not None:
+                verdict = "ACCEPT" if accept else f"REJECT({reason})"
+                logger.info(f"[VAD] {stats.format()} -> {verdict}")
+            elif not accept:
+                logger.info(f"[VAD] speech={n_speech} frames "
+                            f"(< {self._min_speech_frames}) -> REJECT({reason})")
+
+        if accept:
+            self._emit_event()
+        self._reset_vad_state()
 
     def _update_energy(self, data: bytes):
         try:
@@ -299,6 +392,7 @@ class SmartMicrophone(ThreadRunnable):
             if arr.size == 0:
                 return
             rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+            self._last_rms = rms
             self._energy_ema = self._energy_alpha * rms + (1 - self._energy_alpha) * self._energy_ema
         except Exception as e:
             logger.exception(e)
@@ -325,6 +419,9 @@ class SmartMicrophone(ThreadRunnable):
         self._speech_frame_count = 0
         self._silence_frame_count = 0
         self._audio_frames = []
+        self._utterance_feats = []
+        self._utterance_frames = 0
+        self._last_speech_frame_at = 0
 
     def _emit_event(self):
         if self._audio_frames:

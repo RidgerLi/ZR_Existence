@@ -1,4 +1,5 @@
 import devices.headless
+from devices.noise_gate import NoiseGate
 from agent.custom_agent import CustomAgent
 from agent.tool_agent import ToolAgent
 from character.filter.strategy import FirstMatchedFilter
@@ -146,6 +147,18 @@ class ZerolanLiveRobotContext:
                 loopback_device_index=_config.system.aec_loopback_device_index,
             )
 
+        # 抗噪门（能量 / 频谱 / 键盘活动）：见 devices/noise_gate.py 与 docs/noise-robustness.md。
+        # 关闭时麦克风退回仅 webrtcvad 的旧行为（句尾静音裁剪仍然生效）。
+        noise_cfg = _config.system.noise
+        noise_gate = NoiseGate(noise_cfg) if noise_cfg.enable else None
+        # 键盘活动探针：最近 keyboard_suppress_ms 内有击键 → 该帧判为非语音。
+        # 用 lambda 延迟取 self.keyboard（它在本函数更后面才创建）。
+        keyboard_probe = None
+        if noise_cfg.enable and noise_cfg.keyboard_suppress_ms > 0:
+            _kb_window_s = noise_cfg.keyboard_suppress_ms / 1000.0
+            keyboard_probe = lambda: (self.keyboard is not None
+                                      and self.keyboard.recent_keystroke_count(_kb_window_s) > 0)
+
         self.mic = SmartMicrophone(
             enable_vad=True,
             vad_mode=_config.system.microphone_vad_mode,
@@ -158,6 +171,12 @@ class ZerolanLiveRobotContext:
             playback_speech_prob=_config.system.full_duplex_playback_speech_prob,
             enable_barge_in=_config.system.enable_barge_in,
             barge_in_min_ms=_config.system.barge_in_min_ms,
+            noise_gate=noise_gate,
+            keyboard_probe=keyboard_probe,
+            trailing_silence_ms=noise_cfg.trailing_silence_ms,
+            log_utterances=noise_cfg.log_utterances,
+            barge_in_gap_ms=noise_cfg.barge_in_gap_ms,
+            barge_in_grace_ms=noise_cfg.barge_in_grace_ms,
         )
 
         # 把扬声器的本地播放事件接到麦克风的播放状态门控上：

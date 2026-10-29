@@ -1,3 +1,5 @@
+from typing import List
+
 from pydantic import BaseModel, Field
 
 from character.config import CharacterConfig
@@ -111,6 +113,162 @@ class MemoryConfig(BaseModel):
                                                         "interval is only a self-healing fallback, NOT the main trigger.")
 
 
+class BackchannelConfig(BaseModel):
+    """垫话（backchannel）：用户这句话刚被 ASR 识别出来、LLM 还没吐出第一个子句时，
+    先播一极短的应答（"嗯？""在呢"…）盖住这段等待空档，让对话不像断线。
+
+    "说什么"放在 JSON 里（`json_path`，默认 `resources/backchannel.json`），可以按
+    问句/陈述分类、配权重、设定避免重复的窗口；改完保存即热加载，新增句子会在后台
+    用当前音色合成。音频缓存于 `cache_dir`，换音色会自动重建。
+    """
+    enable: bool = Field(default=True,
+                         description="Master switch for the backchannel filler (a short acknowledgement played the "
+                                     "moment the user's sentence is transcribed, before the LLM's first clause).")
+    json_path: str = Field(default='resources/backchannel.json',
+                           description="JSON script that defines WHAT to say (phrases, weights, question/statement "
+                                       "tags, avoid-repeat window). Missing file is created automatically on start. "
+                                       "Edited file is hot-reloaded on the next utterance.")
+    phrases: List[str] = Field(default=['嗯？', '嗯…', '嗯嗯'],
+                               description="Legacy fallback used only when the JSON script is unavailable. Keep the "
+                                           "real list in `json_path`.")
+    min_interval_s: float = Field(default=2.0,
+                                  description="Minimum seconds between two fillers, to avoid a robotic '嗯？ 嗯？' when "
+                                              "the user's speech is split into several ASR fragments. Set it large "
+                                              "(e.g. 3600) if you only want the filler the first time the bot is "
+                                              "addressed.")
+    cache_dir: str = Field(default='resources/cache/backchannel',
+                           description="Where the pre-synthesized filler wav files are cached. Delete this folder to "
+                                       "force a rebuild (they are rebuilt automatically when the voice/prompt changes).")
+    prewarm_on_start: bool = Field(default=True,
+                                   description="Synthesize the filler wav files in the background at startup, so the "
+                                               "very first reply already has zero filler latency.")
+
+
+class NoiseGateConfig(BaseModel):
+    """抗噪门（Noise Gate）：在 webrtcvad 之外再加"能量 + 频谱 + 键盘活动"三重否决，
+    专门对付键盘敲击、咳嗽、桌面震动、环境噪声被误当成用户语音（以及误触发插话打断）。
+
+    所有阈值都只是**额外否决**：门关得再严也不会把非语音变成语音；反之关得松就是恢复旧行为。
+    调参顺序与原理见 `docs/noise-robustness.md`。
+    """
+    enable: bool = Field(default=True,
+                         description="Master switch. When False the microphone falls back to the legacy "
+                                     "webrtcvad-only behaviour (plus the trailing-silence trim).")
+    # ---- 1. 能量门（管"远/轻"：电视、隔壁说话、风扇底噪）----
+    abs_floor_rms: float = Field(default=350.0,
+                                 description="Absolute silence gate in int16 RMS (~-39 dBFS). A frame quieter than "
+                                             "this can never be speech, regardless of VAD.")
+    snr_margin: float = Field(default=2.5,
+                              description="A speech frame must also be this many times louder than the adaptive "
+                                          "noise floor (2.5x ~= +8 dB). Raise it if ambient noise still gets through; "
+                                          "lower it if your quiet voice is being cut.")
+    noise_floor_alpha: float = Field(default=0.002,
+                                     description="EMA rate for the adaptive noise floor, updated only from frames "
+                                                 "that are non-speech, not during playback and not inside an "
+                                                 "utterance. 0.002 @30ms frames ~= 15s time constant.")
+    noise_floor_min: float = Field(default=120.0,
+                                   description="Clamp for the learned noise floor (int16 RMS).")
+    noise_floor_max: float = Field(default=3000.0,
+                                   description="Clamp for the learned noise floor. Prevents a loud transient from "
+                                               "permanently raising the gate above normal speech.")
+    # ---- 2. 键盘活动（管"敲键盘"：与击键时间高度相关，最准的一条）----
+    keyboard_suppress_ms: int = Field(default=250,
+                                      description="If any key was pressed within this many milliseconds, the current "
+                                                  "frame is treated as non-speech. 0 disables keyboard suppression.")
+    # ---- 3. 频谱门（管"宽带瞬态"：键盘、点击、摩擦、一部分咳嗽）----
+    spectral_check: bool = Field(default=True,
+                                 description="Score a whole utterance by the median ZCR / spectral flatness / speech-band "
+                                             "energy ratio of its frames. Median (not per-frame) keeps fricatives like "
+                                             "/s/ /sh/ from killing a real sentence.")
+    max_zcr: float = Field(default=0.22,
+                           description="Reject the utterance if median zero-crossing rate exceeds this. Voiced speech "
+                                       "sits around 0.02-0.12, keyboard clicks around 0.3-0.6.")
+    max_flatness: float = Field(default=0.45,
+                                description="Reject the utterance if median spectral flatness exceeds this. Voiced "
+                                            "speech ~0.05-0.3, broadband clicks/noise ~0.5-0.9.")
+    min_band_ratio: float = Field(default=0.50,
+                                  description="Reject the utterance if the 200-3800 Hz energy share is below this. "
+                                              "Measured on real speech from this setup: 0.58-0.85; white noise ~0.45. "
+                                              "Kept deliberately loose because ZCR/flatness already reject clicks; a "
+                                              "tighter value here only causes false rejects.")
+    min_speech_ratio: float = Field(default=0.30,
+                                    description="Reject if speech frames / frames spanned by the utterance is below "
+                                                "this. It only guards against absurd outliers: a normal sentence with a "
+                                                "couple of pauses lands around 0.4-0.6, so 0.5 used to reject real "
+                                                "speech. Sparse typing is already caught by the keyboard gate and the "
+                                                "spectral gate.")
+    # ---- 4. 插话打断加固（管"说着说着被键盘打断"）----
+    barge_in_frame_check: bool = Field(default=True,
+                                       description="Apply the stricter per-frame spectral test to barge-in detection. "
+                                                   "Barge-in is destructive (it cuts speech), so it must not be "
+                                                   "triggered by clicks or coughs.")
+    barge_in_max_zcr: float = Field(default=0.28, description="Per-frame ZCR ceiling for a barge-in frame.")
+    barge_in_max_flatness: float = Field(default=0.55,
+                                         description="Per-frame spectral-flatness ceiling for a barge-in frame.")
+    barge_in_min_band_ratio: float = Field(default=0.45,
+                                           description="Per-frame speech-band energy floor for a barge-in frame. Real "
+                                                       "speech frames from this mic measured 0.55-0.85, so 0.45 leaves "
+                                                       "headroom; ZCR/flatness still reject clicks.")
+    barge_in_min_speech_prob: float = Field(default=0.65,
+                                            description="A barge-in frame must also have AEC speech probability at/above "
+                                                        "this (full-duplex only; 0 disables the check).")
+    barge_in_gap_ms: int = Field(default=350,
+                                 description="A silence gap this long resets the barge-in evidence counter. Was the "
+                                             "1.2s VAD hangover, which allowed sparse clicks across a long playback "
+                                             "to add up to a false barge-in.")
+    barge_in_grace_ms: int = Field(default=300,
+                                   description="Ignore this much time right after playback starts, while the echo "
+                                               "canceller is still converging on the new audio.")
+    # ---- 5. 收尾与观测 ----
+    trailing_silence_ms: int = Field(default=300,
+                                     description="How much of the end-of-utterance silence to keep in the WAV sent to "
+                                                 "ASR. The VAD still waits the full hangover; this only trims the "
+                                                 "payload, which reduces ASR hallucination on long silences.")
+    log_utterances: bool = Field(default=True,
+                                 description="Log one line per detected utterance with its metrics and accept/reject "
+                                             "reason, e.g. '[VAD] dur=1500ms speech=50 span=52 (96%) rms=... "
+                                             "-> ACCEPT'.")
+
+
+class SelfReviewConfig(BaseModel):
+    """自我回顾与数据留存：token 计量、每日只读日报、随机抽样打分、修改意见提案。
+
+    这些数据落在本地 SQLite（`db_path`），不自动修改任何配置或人设；
+    只有你在面板上"通过"某条修改意见，才会写入 self_state 的"近期调整约定"。
+    """
+    enable: bool = Field(default=True,
+                         description="Enable the daily journal and the whole telemetry/audit pipeline.")
+    db_path: str = Field(default='resources/data/robot.db',
+                         description="Local SQLite file holding token usage, turns, reviews, proposals and "
+                                     "capability runs. Delete it to start from scratch.")
+    journal_dir: str = Field(default='resources/memory/journal',
+                             description="Where the daily read-only journal markdown files are written.")
+    journal_hour: int = Field(default=22,
+                              description="Generate the journal for the current day once the local hour reaches "
+                                          "this value. Set to 0 to generate at midnight, 25 to disable auto-generation.")
+    review_sample_size: int = Field(default=5,
+                                    description="How many unscored turns the Review card samples each time.")
+    review_sample_days: int = Field(default=14,
+                                    description="Only sample turns from the last N days.")
+    proposal_max_items: int = Field(default=3,
+                                    description="Maximum number of revision proposals generated per request.")
+    backfill_history: bool = Field(default=True,
+                                   description="On startup, import the existing working-window history into the "
+                                               "turns table when it is empty, so there is something to score "
+                                               "immediately.")
+
+
+class CapabilityConfig(BaseModel):
+    """本地能力插件：固定目录下的 *.py，每个文件提供 NAME / DESCRIPTION / run(args)。"""
+    enable: bool = Field(default=True,
+                         description="Enable the local capability plugin system.")
+    dir: str = Field(default='capabilities',
+                     description="Directory scanned for capability plugins. Adding/removing a .py file is picked "
+                                 "up automatically (directory mtime), no restart needed.")
+    state_path: str = Field(default='resources/capabilities.json',
+                            description="Where per-capability enabled/disabled state is persisted.")
+
+
 class SystemConfig(BaseModel):
     default_enable_microphone: bool = Field(default=False,
                                             description="For safety, do not open your microphone by default. \n"
@@ -124,10 +282,12 @@ class SystemConfig(BaseModel):
                                                      "sending it to ASR. Raise it (e.g. 1500-2000) if the bot keeps cutting in while you are still "
                                                      "talking / pausing mid-sentence; lower it (e.g. 600-800) for snappier turn-taking. Short pauses "
                                                      "(breaths, hesitations) shorter than this do NOT end the turn.")
-    vad_min_speech_ms: int = Field(default=1000,
+    vad_min_speech_ms: int = Field(default=400,
                                    description="Minimum total speech (ms) an utterance must contain to be sent to ASR. Utterances shorter than this "
-                                               "are treated as VAD jitter/noise and dropped. Lower it (e.g. 300-500) if short replies like '等一下' "
-                                               "are being ignored.")
+                                               "are treated as VAD jitter/noise and dropped. Default 400ms (~13 frames) so that short replies "
+                                               "like '好的' / '等一下' / '你说啥' get through; the noise gate (system.noise) is what keeps "
+                                               "clicks and coughs out, not this duration floor. Raise it (e.g. 800-1000) if a single cough "
+                                               "keeps being transcribed.")
     microphone_hotkey: str = Field(default='f8',
                                    description="Your microphone is set to be off when the program starts. One tap on this hotkey will change its status between on and off.\n" \
                                                "You can pick your own hotkey on Key names like: {} ...".format(
@@ -205,6 +365,16 @@ class SystemConfig(BaseModel):
                                  description='Layered conversation memory (serial pipeline): verbatim hot window -> warm "recent digest" '
                                              '-> long-term vector-DB memory (per-line raw ingest + semantic retrieval), '
                                              'per-turn timestamps, and LLM self-editable goals/todolist.')
+    backchannel: BackchannelConfig = Field(default=BackchannelConfig(),
+                                           description='Short acknowledgement ("嗯？") played as soon as the user\'s sentence is '
+                                                       'transcribed, to cover the wait before the LLM starts speaking.')
+    noise: NoiseGateConfig = Field(default=NoiseGateConfig(),
+                                   description='Noise robustness for the listening layer: adaptive energy gate, keyboard '
+                                               'suppression, utterance-level spectral scoring and a hardened barge-in test.')
+    self_review: SelfReviewConfig = Field(default=SelfReviewConfig(),
+                                          description='Telemetry, daily read-only journal, reply scoring and revision proposals.')
+    capabilities: CapabilityConfig = Field(default=CapabilityConfig(),
+                                           description='Local capability plugins (capabilities/*.py) with UI toggles and run logs.')
 
 
 class ZerolanLiveRobotConfig(BaseModel):
